@@ -22,7 +22,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -30,10 +29,14 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
-	log "github.com/jfjallid/golog"
+	"github.com/jfjallid/golog"
 )
+
+var log = golog.Get("")
 
 func printFiles(files []smb.SharedFile) {
 	if len(files) > 0 {
@@ -60,7 +63,7 @@ func listFilesRecursively(session *smb.Connection, share, parent, dir string) er
 	fmt.Printf("%s:\n", parent)
 	files, err := session.ListDirectory(share, dir, "*")
 	if err != nil {
-		fmt.Printf("Failed to list files in directory %s with error: %s\n", dir, err)
+		log.Errorf("Failed to list files in directory %s with error: %s\n", dir, err)
 		fmt.Println()
 		return nil
 	}
@@ -95,11 +98,11 @@ func listFiles(session *smb.Connection, shares []string, recurse bool) error {
 
 			if err == smb.StatusMap[smb.StatusAccessDenied] {
 				session.TreeDisconnect(share)
+				fmt.Printf("Could connect to [%s] but listing files was prohibited\n", share)
 				continue
 			}
 
 			session.TreeDisconnect(share)
-
 			log.Errorln(err)
 			return err
 		}
@@ -135,21 +138,33 @@ func main() {
 	dirList := flag.Bool("list", false, "Perform directory listing of shares")
 	recurse := flag.Bool("recurse", false, "Recursively list directories on server")
 	shareEnumFlag := flag.Bool("enum", false, "List available SMB shares")
-	excludeShareFlag := flag.String("exshare", "", "Comma-separated list of shares to exclude")
+	excludeShareFlag := flag.String("exclude", "", "Comma-separated list of shares to exclude")
 	noEnc := flag.Bool("noenc", false, "disable smb encryption")
 	forceSMB2 := flag.Bool("smb2", false, "Force smb 2.1")
+	localUser := flag.Bool("local", false, "Authenticate as a local user instead of domain user")
+	dialTimeout := flag.Int("timeout", 5, "Dial timeout in seconds")
+	nullSession := flag.Bool("n", false, "Attempt null session authentication")
 
-	//log.Set("github.com/jfjallid/go-smb/smb", "smb", log.LevelError, log.LstdFlags|log.Lshortfile, log.DefaultOutput)
-	//log.SetFlags(log.LstdFlags | log.Lshortfile)
+	flag.Parse()
+
+	if *debug {
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
+		log.SetLogLevel(golog.LevelDebug)
+	} else {
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+	}
+
 	shares := []string{}
 	netShares := []dcerpc.NetShare{}
 	var hashBytes []byte
 	var err error
 
-	flag.Parse()
-
 	if *host == "" {
 		log.Errorln("Must specify a hostname")
+		flag.Usage()
 		return
 	}
 
@@ -166,6 +181,11 @@ func main() {
 		}
 	}
 
+	if *dialTimeout < 1 {
+		log.Errorln("Valid value for the timeout is > 0 seconds")
+		return
+	}
+
 	if *hash != "" {
 		hashBytes, err = hex.DecodeString(*hash)
 		if err != nil {
@@ -175,17 +195,15 @@ func main() {
 		}
 	}
 
-	if (*password == "") && (hashBytes == nil) {
-		reader := bufio.NewReader(os.Stdin)
+	if (*password == "") && (hashBytes == nil) && (*username != "") {
 		fmt.Printf("Enter password: ")
-		pass, err := reader.ReadString('\n')
+		passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
 		if err != nil {
 			log.Errorln(err)
 			return
 		}
-        pass = strings.TrimSuffix(pass, "\n") // Remove Linux newline
-        pass = strings.TrimSuffix(pass, "\r") // Remove Windows Carriage Return
-		*password = pass
+		*password = string(passBytes)
 	}
 
 	// Put excluded shares in a map
@@ -195,6 +213,11 @@ func main() {
 		excludedShares[part] = true
 	}
 
+	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", *dialTimeout))
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
 	options := smb.Options{
 		Host: *host,
 		Port: *port,
@@ -203,12 +226,16 @@ func main() {
 			Password:           *password,
 			Hash:               hashBytes,
 			Domain:             *domain,
+			LocalUser:          *localUser,
+			NullSession:        *nullSession,
 			EncryptionDisabled: *noEnc,
 		},
 		DisableEncryption: *noEnc,
-		ForceSMB2:         *forceSMB2,
+		//RequireMessageSigning: true,
+		ForceSMB2:   *forceSMB2,
+		DialTimeout: timeout,
 	}
-	session, err := smb.NewConnection(options, *debug)
+	session, err := smb.NewConnection(options)
 	if err != nil {
 		log.Criticalln(err)
 		return
@@ -277,6 +304,7 @@ func main() {
 
 		log.Debugf("Retrieved list of %d shares\n", len(shares))
 
+		fmt.Printf("\n#### %s ####\n", *host)
 		if *dirList {
 			err = listFiles(session, shares, *recurse)
 			if err != nil {
@@ -290,6 +318,7 @@ func main() {
 			}
 		}
 	} else {
+		fmt.Printf("#### %s ####\n", *host)
 		// Use specified list of shares
 		err = listFiles(session, shares, *recurse)
 		if err != nil {
