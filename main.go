@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"golang.org/x/term"
+	rundebug "runtime/debug"
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
@@ -37,6 +38,17 @@ import (
 )
 
 var log = golog.Get("")
+var release string = "0.1"
+
+func isFlagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
 
 func printFiles(files []smb.SharedFile) {
 	if len(files) > 0 {
@@ -126,28 +138,70 @@ func listFiles(session *smb.Connection, shares []string, recurse bool) error {
 	return nil
 }
 
+var helpMsg = `
+    Usage: ` + os.Args[0] + ` [options]
+
+    options:
+          --host       Hostname or ip address of remote server
+      -p, --port       SMB Port (default 445)
+      -d, --domain     Domain name to use for login
+      -u, --user       Username
+      -P, --pass       Password
+          --hash       Hex encoded NT Hash for user password
+          --local      Authenticate as a local user instead of domain user
+      -n, --null	   Attempt null session authentication
+      -t, --timeout    Dial timeout in seconds (default 5)
+          --enum       List available SMB shares
+          --exclude    Comma-separated list of shares to exclude
+          --list       Perform directory listing of shares
+          --shares     Comma-separated list of shares to connect to
+      -r, --recurse    Recursively list directories on server
+          --noenc      Disable smb encryption
+          --smb2       Force smb 2.1
+          --debug      Enable debug logging
+      -v, --version    Show version
+`
+
 func main() {
-	host := flag.String("host", "", "host")
-	username := flag.String("user", "", "username")
-	password := flag.String("pass", "", "password")
-	hash := flag.String("hash", "", "hex encoded NT Hash for user")
-	domain := flag.String("d", "", "domain")
-	port := flag.Int("port", 445, "SMB Port")
-	debug := flag.Bool("debug", false, "enable debugging")
-	shareFlag := flag.String("shares", "", "Comma-separated list of shares to connect to")
-	dirList := flag.Bool("list", false, "Perform directory listing of shares")
-	recurse := flag.Bool("recurse", false, "Recursively list directories on server")
-	shareEnumFlag := flag.Bool("enum", false, "List available SMB shares")
-	excludeShareFlag := flag.String("exclude", "", "Comma-separated list of shares to exclude")
-	noEnc := flag.Bool("noenc", false, "disable smb encryption")
-	forceSMB2 := flag.Bool("smb2", false, "Force smb 2.1")
-	localUser := flag.Bool("local", false, "Authenticate as a local user instead of domain user")
-	dialTimeout := flag.Int("timeout", 5, "Dial timeout in seconds")
-	nullSession := flag.Bool("n", false, "Attempt null session authentication")
+	var host, username, password, hash, domain, shareFlag, excludeShareFlag string
+	var port, dialTimeout int
+	var debug, dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version bool
+
+	flag.Usage = func() {
+		fmt.Println(helpMsg)
+		os.Exit(0)
+	}
+
+	flag.StringVar(&host, "host", "", "")
+	flag.StringVar(&username, "u", "", "")
+	flag.StringVar(&username, "user", "", "")
+	flag.StringVar(&password, "P", "", "")
+	flag.StringVar(&password, "pass", "", "")
+	flag.StringVar(&hash, "hash", "", "")
+	flag.StringVar(&domain, "d", "", "")
+	flag.StringVar(&domain, "domain", "", "")
+	flag.IntVar(&port, "p", 445, "")
+	flag.IntVar(&port, "port", 445, "")
+	flag.BoolVar(&debug, "debug", false, "")
+	flag.StringVar(&shareFlag, "shares", "", "")
+	flag.BoolVar(&dirList, "list", false, "")
+	flag.BoolVar(&recurse, "r", false, "")
+	flag.BoolVar(&recurse, "recurse", false, "")
+	flag.BoolVar(&shareEnumFlag, "enum", false, "")
+	flag.StringVar(&excludeShareFlag, "exclude", "", "")
+	flag.BoolVar(&noEnc, "noenc", false, "")
+	flag.BoolVar(&forceSMB2, "smb2", false, "")
+	flag.BoolVar(&localUser, "local", false, "")
+	flag.IntVar(&dialTimeout, "t", 5, "")
+	flag.IntVar(&dialTimeout, "timeout", 5, "")
+	flag.BoolVar(&nullSession, "n", false, "")
+	flag.BoolVar(&nullSession, "null", false, "")
+	flag.BoolVar(&version, "v", false, "")
+	flag.BoolVar(&version, "version", false, "")
 
 	flag.Parse()
 
-	if *debug {
+	if debug {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
@@ -157,37 +211,49 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
 	}
 
+	if version {
+		fmt.Printf("Version: %s\n", release)
+		bi, ok := rundebug.ReadBuildInfo()
+		if !ok {
+			log.Errorln("Failed to read build info to locate version imported modules")
+		}
+		for _, m := range bi.Deps {
+			fmt.Printf("Package: %s, Version: %s\n", m.Path, m.Version)
+		}
+		return
+	}
+
 	shares := []string{}
 	netShares := []dcerpc.NetShare{}
 	var hashBytes []byte
 	var err error
 
-	if *host == "" {
+	if host == "" {
 		log.Errorln("Must specify a hostname")
 		flag.Usage()
 		return
 	}
 
-	if !*shareEnumFlag {
-		if *shareFlag == "" {
+	if !shareEnumFlag {
+		if shareFlag == "" {
 			log.Errorln("Please specify a share name or the share enumeration flag.")
 			return
 		}
-		shares = strings.Split(*shareFlag, ",")
+		shares = strings.Split(shareFlag, ",")
 
-		if !*dirList {
+		if !dirList {
 			log.Errorln("Please specify share enum flag or list flag!")
 			return
 		}
 	}
 
-	if *dialTimeout < 1 {
+	if dialTimeout < 1 {
 		log.Errorln("Valid value for the timeout is > 0 seconds")
 		return
 	}
 
-	if *hash != "" {
-		hashBytes, err = hex.DecodeString(*hash)
+	if hash != "" {
+		hashBytes, err = hex.DecodeString(hash)
 		if err != nil {
 			fmt.Println("Failed to decode hash")
 			log.Errorln(err)
@@ -195,45 +261,49 @@ func main() {
 		}
 	}
 
-	if (*password == "") && (hashBytes == nil) && (*username != "") {
-		fmt.Printf("Enter password: ")
-		passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Println()
-		if err != nil {
-			log.Errorln(err)
-			return
+	if (password == "") && (hashBytes == nil) {
+		if (username != "") && (!nullSession) {
+			// Check if password is already specified to be empty
+			if !isFlagSet("P") && !isFlagSet("pass") {
+				fmt.Printf("Enter password: ")
+				passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+				fmt.Println()
+				if err != nil {
+					log.Errorln(err)
+					return
+				}
+				password = string(passBytes)
+			}
 		}
-		*password = string(passBytes)
 	}
 
 	// Put excluded shares in a map
-	parts := strings.Split(*excludeShareFlag, ",")
+	parts := strings.Split(excludeShareFlag, ",")
 	excludedShares := make(map[string]bool)
 	for _, part := range parts {
 		excludedShares[part] = true
 	}
 
-	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", *dialTimeout))
+	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
 	if err != nil {
 		log.Errorln(err)
 		return
 	}
 	options := smb.Options{
-		Host: *host,
-		Port: *port,
+		Host: host,
+		Port: port,
 		Initiator: &smb.NTLMInitiator{
-			User:               *username,
-			Password:           *password,
+			User:               username,
+			Password:           password,
 			Hash:               hashBytes,
-			Domain:             *domain,
-			LocalUser:          *localUser,
-			NullSession:        *nullSession,
-			EncryptionDisabled: *noEnc,
+			Domain:             domain,
+			LocalUser:          localUser,
+			NullSession:        nullSession,
+			EncryptionDisabled: noEnc,
 		},
-		DisableEncryption: *noEnc,
-		//RequireMessageSigning: true,
-		ForceSMB2:   *forceSMB2,
-		DialTimeout: timeout,
+		DisableEncryption: noEnc,
+		ForceSMB2:         forceSMB2,
+		DialTimeout:       timeout,
 	}
 	session, err := smb.NewConnection(options)
 	if err != nil {
@@ -242,7 +312,7 @@ func main() {
 	}
 	defer session.Close()
 
-	if session.IsSigningRequired {
+	if session.IsSigningRequired.Load() {
 		log.Noticeln("[-] Signing is required")
 	} else {
 		log.Noticeln("[+] Signing is NOT required")
@@ -254,7 +324,7 @@ func main() {
 		log.Noticeln("[-] Login failed")
 	}
 
-	if *shareEnumFlag {
+	if shareEnumFlag {
 		share := "IPC$"
 		err := session.TreeConnect(share)
 		if err != nil {
@@ -278,7 +348,7 @@ func main() {
 		}
 		log.Infoln("Successfully performed Bind to service")
 
-		result, err := bind.NetShareEnumAll(*host)
+		result, err := bind.NetShareEnumAll(host)
 		if err != nil {
 			log.Errorln(err)
 			f.CloseFile()
@@ -304,9 +374,9 @@ func main() {
 
 		log.Debugf("Retrieved list of %d shares\n", len(shares))
 
-		fmt.Printf("\n#### %s ####\n", *host)
-		if *dirList {
-			err = listFiles(session, shares, *recurse)
+		fmt.Printf("\n#### %s ####\n", host)
+		if dirList {
+			err = listFiles(session, shares, recurse)
 			if err != nil {
 				log.Errorln(err)
 				return
@@ -318,9 +388,9 @@ func main() {
 			}
 		}
 	} else {
-		fmt.Printf("#### %s ####\n", *host)
+		fmt.Printf("#### %s ####\n", host)
 		// Use specified list of shares
-		err = listFiles(session, shares, *recurse)
+		err = listFiles(session, shares, recurse)
 		if err != nil {
 			log.Errorln(err)
 			return
