@@ -26,11 +26,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path"
+	"regexp"
 	"strings"
 	"time"
 
-	"golang.org/x/term"
 	rundebug "runtime/debug"
+
+	"golang.org/x/term"
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
@@ -38,7 +41,11 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1"
+var release string = "0.1.1"
+var includedExts map[string]interface{}
+var excludedExts map[string]interface{}
+var excludedFolders map[string]interface{}
+var nameRegexp *regexp.Regexp
 
 func isFlagSet(name string) bool {
 	found := false
@@ -70,18 +77,69 @@ func printFiles(files []smb.SharedFile) {
 	fmt.Println()
 }
 
+func filterFiles(input []smb.SharedFile) []smb.SharedFile {
+	files := make([]smb.SharedFile, 0)
+	if len(input) > 0 {
+		for _, file := range input {
+			if file.IsDir || file.IsJunction {
+				files = append(files, file)
+				continue
+			}
+			// Check file extension
+			fileExt := strings.TrimPrefix(path.Ext(file.Name), ".")
+			if includedExts != nil {
+				if _, ok := includedExts[fileExt]; !ok {
+					// Skip file
+					continue
+				}
+			} else if excludedExts != nil {
+				if _, ok := excludedExts[fileExt]; ok {
+					// Skip file
+					continue
+				}
+			}
+
+			// Check name regexp
+			if nameRegexp != nil {
+				if !nameRegexp.MatchString(file.Name) {
+					// Skip file
+					continue
+				}
+			}
+
+			// File was either include by extension and regexp
+			// or not explicitly excluded so keep it in the result
+			files = append(files, file)
+		}
+	}
+
+	return files
+}
+
 func listFilesRecursively(session *smb.Connection, share, parent, dir string) error {
 	parent = fmt.Sprintf("%s\\%s", share, parent)
-	fmt.Printf("%s:\n", parent)
 	files, err := session.ListDirectory(share, dir, "*")
 	if err != nil {
 		log.Errorf("Failed to list files in directory %s with error: %s\n", dir, err)
 		fmt.Println()
 		return nil
 	}
+
+	// Remove filtered files
+	files = filterFiles(files)
+	if len(files) == 0 {
+		return nil
+	}
+
+	fmt.Printf("%s:\n", parent)
 	printFiles(files)
 	for _, file := range files {
 		if file.IsDir && !file.IsJunction {
+			// Check if folder is filtered
+			if _, ok := excludedFolders[file.Name]; ok {
+				// Skip recursing into folder
+				continue
+			}
 			err = listFilesRecursively(session, share, file.FullPath, file.FullPath)
 			if err != nil {
 				log.Errorln(err)
@@ -119,11 +177,19 @@ func listFiles(session *smb.Connection, shares []string, recurse bool) error {
 			return err
 		}
 
+		// Remove filtered files
+		files = filterFiles(files)
+
 		fmt.Printf("\n#### Listing files for share (%s) ####\n", share)
 		printFiles(files)
 		if recurse {
 			for _, file := range files {
 				if file.IsDir && !file.IsJunction {
+					// Check if folder is filtered
+					if _, ok := excludedFolders[file.Name]; ok {
+						// Skip recursing into folder
+						continue
+					}
 					err = listFilesRecursively(session, share, file.Name, file.FullPath)
 					if err != nil {
 						log.Errorln(err)
@@ -142,30 +208,35 @@ var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
     options:
-          --host       Hostname or ip address of remote server
-      -p, --port       SMB Port (default 445)
-      -d, --domain     Domain name to use for login
-      -u, --user       Username
-      -P, --pass       Password
-          --hash       Hex encoded NT Hash for user password
-          --local      Authenticate as a local user instead of domain user
-      -n, --null	   Attempt null session authentication
-      -t, --timeout    Dial timeout in seconds (default 5)
-          --enum       List available SMB shares
-          --exclude    Comma-separated list of shares to exclude
-          --list       Perform directory listing of shares
-          --shares     Comma-separated list of shares to connect to
-      -r, --recurse    Recursively list directories on server
-          --noenc      Disable smb encryption
-          --smb2       Force smb 2.1
-          --debug      Enable debug logging
-      -v, --version    Show version
+          --host            Hostname or ip address of remote server
+      -P, --port            SMB Port (default 445)
+      -d, --domain          Domain name to use for login
+      -u, --user            Username
+      -p, --pass            Password
+          --hash            Hex encoded NT Hash for user password
+          --local           Authenticate as a local user instead of domain user
+      -n, --null	        Attempt null session authentication
+      -t, --timeout         Dial timeout in seconds (default 5)
+          --enum            List available SMB shares
+          --exclude         Comma-separated list of shares to exclude
+          --list            Perform directory listing of shares
+          --shares          Comma-separated list of shares to connect to
+          --include-name    Regular expression filter for files to include in the result
+          --include-exts    Comma-separated list of file extensions to include in the result. Mutually exclusive with exclude-ext
+          --exclude-exts    Comma-separated list of file extensions to exclude from the result. Mutually exclusive with include-ext
+          --exclude-folders Comma-separated list of folders to not traverse with recursion
+      -r, --recurse         Recursively list directories on server
+          --noenc           Disable smb encryption
+          --smb2            Force smb 2.1
+          --debug           Enable debug logging
+      -v, --version         Show version
 `
 
 func main() {
-	var host, username, password, hash, domain, shareFlag, excludeShareFlag string
+	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder string
 	var port, dialTimeout int
 	var debug, dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version bool
+	var err error
 
 	flag.Usage = func() {
 		fmt.Println(helpMsg)
@@ -175,12 +246,12 @@ func main() {
 	flag.StringVar(&host, "host", "", "")
 	flag.StringVar(&username, "u", "", "")
 	flag.StringVar(&username, "user", "", "")
-	flag.StringVar(&password, "P", "", "")
+	flag.StringVar(&password, "p", "", "")
 	flag.StringVar(&password, "pass", "", "")
 	flag.StringVar(&hash, "hash", "", "")
 	flag.StringVar(&domain, "d", "", "")
 	flag.StringVar(&domain, "domain", "", "")
-	flag.IntVar(&port, "p", 445, "")
+	flag.IntVar(&port, "P", 445, "")
 	flag.IntVar(&port, "port", 445, "")
 	flag.BoolVar(&debug, "debug", false, "")
 	flag.StringVar(&shareFlag, "shares", "", "")
@@ -189,6 +260,10 @@ func main() {
 	flag.BoolVar(&recurse, "recurse", false, "")
 	flag.BoolVar(&shareEnumFlag, "enum", false, "")
 	flag.StringVar(&excludeShareFlag, "exclude", "", "")
+	flag.StringVar(&includeName, "include-name", "", "")
+	flag.StringVar(&includeExt, "include-exts", "", "")
+	flag.StringVar(&excludeExt, "exclude-exts", "", "")
+	flag.StringVar(&excludeFolder, "exclude-folders", "", "")
 	flag.BoolVar(&noEnc, "noenc", false, "")
 	flag.BoolVar(&forceSMB2, "smb2", false, "")
 	flag.BoolVar(&localUser, "local", false, "")
@@ -223,10 +298,49 @@ func main() {
 		return
 	}
 
+	// Validate regexp if set
+	if includeName != "" {
+		nameRegexp, err = regexp.Compile(includeName)
+		if err != nil {
+			log.Errorln(err)
+			flag.Usage()
+			return
+		}
+	}
+
+	if includeExt != "" && excludeExt != "" {
+		log.Errorln("--include-ext and --exclude-ext are mutually exclusive, so don't supply both!")
+		flag.Usage()
+		return
+	}
+
+	if includeExt != "" {
+		includedExts = make(map[string]interface{})
+		exts := strings.Split(includeExt, ",")
+		for _, e := range exts {
+			includedExts[e] = nil
+		}
+	}
+
+	if excludeExt != "" {
+		excludedExts = make(map[string]interface{})
+		exts := strings.Split(excludeExt, ",")
+		for _, e := range exts {
+			excludedExts[e] = nil
+		}
+	}
+
+	if excludeFolder != "" {
+		excludedFolders = make(map[string]interface{})
+		folders := strings.Split(excludeFolder, ",")
+		for _, f := range folders {
+			excludedFolders[f] = nil
+		}
+	}
+
 	shares := []string{}
 	netShares := []dcerpc.NetShare{}
 	var hashBytes []byte
-	var err error
 
 	if host == "" {
 		log.Errorln("Must specify a hostname")
