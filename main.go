@@ -41,11 +41,12 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.1"
+var release string = "0.1.2"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
 var nameRegexp *regexp.Regexp
+var fileSizeThreshold uint64
 
 func isFlagSet(name string) bool {
 	found := false
@@ -65,6 +66,10 @@ func printFiles(files []smb.SharedFile) {
 				fileType = "dir"
 			} else if file.IsJunction {
 				fileType = "link"
+			}
+			if (fileType == "file") && (file.Size < fileSizeThreshold) {
+				// Skip displaying file
+				continue
 			}
 			// Microsoft handles time as number of 100-nanosecond intervals since January 1, 1601 UTC
 			// So to get a timestamp with unix time, subtract difference in 100-nanosecond intervals
@@ -225,6 +230,7 @@ var helpMsg = `
           --include-exts    Comma-separated list of file extensions to include in the result. Mutually exclusive with exclude-ext
           --exclude-exts    Comma-separated list of file extensions to exclude from the result. Mutually exclusive with include-ext
           --exclude-folders Comma-separated list of folders to not traverse with recursion
+          --min-size        Minimum file size to include in results in bytes
       -r, --recurse         Recursively list directories on server
           --noenc           Disable smb encryption
           --smb2            Force smb 2.1
@@ -264,6 +270,7 @@ func main() {
 	flag.StringVar(&includeExt, "include-exts", "", "")
 	flag.StringVar(&excludeExt, "exclude-exts", "", "")
 	flag.StringVar(&excludeFolder, "exclude-folders", "", "")
+	flag.Uint64Var(&fileSizeThreshold, "min-size", 0, "")
 	flag.BoolVar(&noEnc, "noenc", false, "")
 	flag.BoolVar(&forceSMB2, "smb2", false, "")
 	flag.BoolVar(&localUser, "local", false, "")
