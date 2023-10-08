@@ -41,12 +41,14 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.2"
+var release string = "0.1.3"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
 var nameRegexp *regexp.Regexp
 var fileSizeThreshold uint64
+var downloadDir string
+var download bool
 
 func isFlagSet(name string) bool {
 	found := false
@@ -121,6 +123,71 @@ func filterFiles(input []smb.SharedFile) []smb.SharedFile {
 	return files
 }
 
+func downloadFiles(session *smb.Connection, share string, files []smb.SharedFile) {
+	if len(files) > 0 {
+		for _, file := range files {
+			if file.IsDir || file.IsJunction {
+				// Skip
+				continue
+			}
+
+			if file.Size < fileSizeThreshold {
+				// Skip downloading file
+				continue
+			}
+			// Determine full relative file path
+			filepath := path.Clean(file.FullPath)
+			if path.IsAbs(filepath) {
+				// Could this be bypassed to escape to an absolute path?
+				filepath = strings.TrimPrefix(filepath, string(os.PathSeparator))
+			}
+
+			if os.PathSeparator == '\\' {
+				filepath = strings.ReplaceAll(filepath, "/", "\\")
+			} else {
+				filepath = strings.ReplaceAll(filepath, "\\", "/")
+			}
+			/* This does not work properly if the separator in the filepath
+			 * differs from the os specific path separator e.g., if the windows
+			 * path is share\dir1\file and the client os is linux with a default
+			 * path separator of /, then the Split function will fail to split
+			 * the filename from the path.
+			 */
+			dir, filename := path.Split(filepath)
+
+			// Create sub folders if they do not already exist
+			fulldir := ""
+			if dir != "" {
+				fulldir = downloadDir + string(os.PathSeparator) + strings.TrimSuffix(dir, string(os.PathSeparator))
+			} else {
+				fulldir = downloadDir
+			}
+
+			err := os.MkdirAll(fulldir, 0755)
+			if err != nil {
+				log.Errorf("Failed to create dir %s with error: %v\n", err)
+				continue
+			}
+
+			// Open local file in the subdir and start downloading the file
+			f, err := os.OpenFile(fulldir+string(os.PathSeparator)+filename, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
+			if err != nil {
+				log.Errorln(err)
+				continue
+			}
+
+			// Call library function to retrieve the file
+			err = session.RetrieveFile(share, file.FullPath, 0, f.Write)
+			if err != nil {
+				log.Errorln(err)
+				f.Close()
+				continue
+			}
+			f.Close()
+		}
+	}
+}
+
 func listFilesRecursively(session *smb.Connection, share, parent, dir string) error {
 	parent = fmt.Sprintf("%s\\%s", share, parent)
 	files, err := session.ListDirectory(share, dir, "*")
@@ -138,6 +205,10 @@ func listFilesRecursively(session *smb.Connection, share, parent, dir string) er
 
 	fmt.Printf("%s:\n", parent)
 	printFiles(files)
+	if download {
+		downloadFiles(session, share, files)
+	}
+
 	for _, file := range files {
 		if file.IsDir && !file.IsJunction {
 			// Check if folder is filtered
@@ -187,6 +258,9 @@ func listFiles(session *smb.Connection, shares []string, recurse bool) error {
 
 		fmt.Printf("\n#### Listing files for share (%s) ####\n", share)
 		printFiles(files)
+		if download {
+			downloadFiles(session, share, files)
+		}
 		if recurse {
 			for _, file := range files {
 				if file.IsDir && !file.IsJunction {
@@ -213,29 +287,32 @@ var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
     options:
-          --host            Hostname or ip address of remote server
-      -P, --port            SMB Port (default 445)
-      -d, --domain          Domain name to use for login
-      -u, --user            Username
-      -p, --pass            Password
-          --hash            Hex encoded NT Hash for user password
-          --local           Authenticate as a local user instead of domain user
-      -n, --null	        Attempt null session authentication
-      -t, --timeout         Dial timeout in seconds (default 5)
-          --enum            List available SMB shares
-          --exclude         Comma-separated list of shares to exclude
-          --list            Perform directory listing of shares
-          --shares          Comma-separated list of shares to connect to
-          --include-name    Regular expression filter for files to include in the result
-          --include-exts    Comma-separated list of file extensions to include in the result. Mutually exclusive with exclude-ext
-          --exclude-exts    Comma-separated list of file extensions to exclude from the result. Mutually exclusive with include-ext
-          --exclude-folders Comma-separated list of folders to not traverse with recursion
-          --min-size        Minimum file size to include in results in bytes
-      -r, --recurse         Recursively list directories on server
-          --noenc           Disable smb encryption
-          --smb2            Force smb 2.1
-          --debug           Enable debug logging
-      -v, --version         Show version
+          --host                Hostname or ip address of remote server
+      -P, --port                SMB Port (default 445)
+      -d, --domain              Domain name to use for login
+      -u, --user                Username
+      -p, --pass                Password
+          --hash                Hex encoded NT Hash for user password
+          --local               Authenticate as a local user instead of domain user
+      -n, --null	            Attempt null session authentication
+      -t, --timeout             Dial timeout in seconds (default 5)
+          --enum                List available SMB shares
+          --exclude             Comma-separated list of shares to exclude
+          --list                Perform directory listing of shares
+          --shares              Comma-separated list of shares to connect to
+          --include-name        Regular expression filter for files to include in the result
+          --include-exts        Comma-separated list of file extensions to include in the result.
+                                Mutually exclusive with exclude-ext
+          --exclude-exts        Comma-separated list of file extensions to exclude from the result.
+                                Mutually exclusive with include-ext
+          --exclude-folders     Comma-separated list of folders to not traverse with recursion
+          --min-size            Minimum file size to include in results in bytes
+          --download <outdir>   Attempt to download all the files in the filtered result set.
+      -r, --recurse             Recursively list directories on server
+          --noenc               Disable smb encryption
+          --smb2                Force smb 2.1
+          --debug               Enable debug logging
+      -v, --version             Show version
 `
 
 func main() {
@@ -271,6 +348,7 @@ func main() {
 	flag.StringVar(&excludeExt, "exclude-exts", "", "")
 	flag.StringVar(&excludeFolder, "exclude-folders", "", "")
 	flag.Uint64Var(&fileSizeThreshold, "min-size", 0, "")
+	flag.StringVar(&downloadDir, "download", "", "")
 	flag.BoolVar(&noEnc, "noenc", false, "")
 	flag.BoolVar(&forceSMB2, "smb2", false, "")
 	flag.BoolVar(&localUser, "local", false, "")
@@ -291,6 +369,7 @@ func main() {
 	} else {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 	}
 
 	if version {
@@ -303,6 +382,13 @@ func main() {
 			fmt.Printf("Package: %s, Version: %s\n", m.Path, m.Version)
 		}
 		return
+	}
+
+	if isFlagSet("download") {
+		download = true
+		if downloadDir == "" {
+			downloadDir = "."
+		}
 	}
 
 	// Validate regexp if set
