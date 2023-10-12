@@ -41,7 +41,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.3"
+var release string = "0.1.4"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -362,14 +362,13 @@ func main() {
 	flag.Parse()
 
 	if debug {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelDebug)
 	} else {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
-		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 	}
 
 	if version {

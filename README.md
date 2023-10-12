@@ -10,24 +10,32 @@ and provides functionality to list SMB shares and enumerate the files.
 Usage: ./go-shareenum [options]
 
 options:
-      --host       Hostname or ip address of remote server
-  -p, --port       SMB Port (default 445)
-  -d, --domain     Domain name to use for login
-  -u, --user       Username
-  -P, --pass       Password
-      --hash       Hex encoded NT Hash for user password
-      --local      Authenticate as a local user instead of domain user
-  -n, --null	   Attempt null session authentication
-  -t, --timeout    Dial timeout in seconds (default 5)
-      --enum       List available SMB shares
-      --exclude    Comma-separated list of shares to exclude
-      --list       Perform directory listing of shares
-      --shares     Comma-separated list of shares to connect to
-  -r, --recurse    Recursively list directories on server
-      --noenc      Disable smb encryption
-      --smb2       Force smb 2.1
-      --debug      Enable debug logging
-  -v, --version    Show version
+      --host                Hostname or ip address of remote server
+  -P, --port                SMB Port (default 445)
+  -d, --domain              Domain name to use for login
+  -u, --user                Username
+  -p, --pass                Password
+      --hash                Hex encoded NT Hash for user password
+      --local               Authenticate as a local user instead of domain user
+  -n, --null	            Attempt null session authentication
+  -t, --timeout             Dial timeout in seconds (default 5)
+      --enum                List available SMB shares
+      --exclude             Comma-separated list of shares to exclude
+      --list                Perform directory listing of shares
+      --shares              Comma-separated list of shares to connect to
+      --include-name        Regular expression filter for files to include in the result
+      --include-exts        Comma-separated list of file extensions to include in the result.
+                            Mutually exclusive with exclude-ext
+      --exclude-exts        Comma-separated list of file extensions to exclude from the result.
+                            Mutually exclusive with include-ext
+      --exclude-folders     Comma-separated list of folders to not traverse with recursion
+      --min-size            Minimum file size to include in results in bytes
+      --download <outdir>   Attempt to download all the files in the filtered result set.
+  -r, --recurse             Recursively list directories on server
+      --noenc               Disable smb encryption
+      --smb2                Force smb 2.1
+      --debug               Enable debug logging
+  -v, --version             Show version
 ```
 
 ## Examples

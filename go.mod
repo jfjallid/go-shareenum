@@ -4,7 +4,7 @@ go 1.19
 
 require (
 	github.com/jfjallid/go-smb v0.2.3
-	github.com/jfjallid/golog v0.3.1
+	github.com/jfjallid/golog v0.3.2
 	golang.org/x/term v0.5.0
 )
 
