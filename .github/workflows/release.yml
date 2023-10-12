@@ -33,7 +33,7 @@ jobs:
         UPLOAD_URL="https://uploads.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets"
 
         # Upload asset 1
-        curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -H "Content-Type: application/octet-stream" --data-binary @"$ASSET_NAME_1" "$UPLOAD_URL?name=$ASSET_NAME_1"
+        curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Content-Type: application/octet-stream" --data-binary @"$ASSET_NAME_1" "$UPLOAD_URL?name=$ASSET_NAME_1"
 
         # Upload asset 2
-        curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -H "Content-Type: application/octet-stream" --data-binary @"$ASSET_NAME_2" "$UPLOAD_URL?name=$ASSET_NAME_2"
+        curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Content-Type: application/octet-stream" --data-binary @"$ASSET_NAME_2" "$UPLOAD_URL?name=$ASSET_NAME_2"
