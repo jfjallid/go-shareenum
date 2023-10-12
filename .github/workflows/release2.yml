@@ -1,6 +1,6 @@
 # This workflow will build binaries for Linux and Windows x64 architecture
 
-name: release
+name: publish
 
 on:
   release:
