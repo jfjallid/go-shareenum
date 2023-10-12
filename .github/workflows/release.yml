@@ -8,6 +8,8 @@ on:
 
 jobs:
   build:
+    permissions:
+      contents: write # to allow upload of release assets
     runs-on: ubuntu-latest
     steps:
     - name: checkout repo
