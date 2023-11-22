@@ -41,7 +41,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.4"
+var release string = "0.1.5"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -192,8 +192,7 @@ func listFilesRecursively(session *smb.Connection, share, parent, dir string) er
 	parent = fmt.Sprintf("%s\\%s", share, parent)
 	files, err := session.ListDirectory(share, dir, "*")
 	if err != nil {
-		log.Errorf("Failed to list files in directory %s with error: %s\n", dir, err)
-		fmt.Println()
+		log.Infof("Failed to list files in directory (%s) with error: %s\n", dir, err)
 		return nil
 	}
 
