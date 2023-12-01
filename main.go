@@ -41,7 +41,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.5"
+var release string = "0.1.6"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
