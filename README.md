@@ -2,7 +2,7 @@
 
 ## Description
 Package go-shareenum is a tool build to enumerate SMB shares in a Windows
-domain. It is built on top of the library https://github.com/jfjallid/go-smb
+domain. It is built on top of the library [go-smb](https://github.com/jfjallid/go-smb)
 and provides functionality to list SMB shares and enumerate the files.
 
 ## Usage
@@ -15,9 +15,10 @@ options:
   -d, --domain              Domain name to use for login
   -u, --user                Username
   -p, --pass                Password
+  -n, --no-pass             Disable password prompt and send no credentials
       --hash                Hex encoded NT Hash for user password
       --local               Authenticate as a local user instead of domain user
-  -n, --null	            Attempt null session authentication
+      --null	            Attempt null session authentication
   -t, --timeout             Dial timeout in seconds (default 5)
       --enum                List available SMB shares
       --exclude             Comma-separated list of shares to exclude
@@ -32,9 +33,17 @@ options:
       --min-size            Minimum file size to include in results in bytes
       --download <outdir>   Attempt to download all the files in the filtered result set.
   -r, --recurse             Recursively list directories on server
+      --relay               Start an SMB listener that will relay incoming
+                            NTLM authentications to the remote server and
+                            use that connection. NOTE that this forces SMB 2.1
+                            without encryption.
+      --relay-port <port>   Listening port for relay (default 445)
+      --socks-host <target> Establish connection via a SOCKS5 proxy server
+      --socks-port <port>   SOCKS5 proxy port (default 1080)
       --noenc               Disable smb encryption
       --smb2                Force smb 2.1
       --debug               Enable debug logging
+      --verbose             Enable verbose logging
   -v, --version             Show version
 ```
 
