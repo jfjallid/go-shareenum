@@ -16,6 +16,7 @@ options:
   -u, --user                Username
   -p, --pass                Password
   -n, --no-pass             Disable password prompt and send no credentials
+  -i, --interactive         Start an interactive session
       --hash                Hex encoded NT Hash for user password
       --local               Authenticate as a local user instead of domain user
       --null	            Attempt null session authentication
@@ -72,4 +73,10 @@ options:
 
 ```
 ./go-shareenum --host server001 --user Administrator --pass adminPass123 --enum --recurse --list --exclude "ADMIN$,C$"
+```
+
+### Start an interactive session
+
+```
+./go-shareenum --host server001 --user Administrator --pass adminPass123 --interactive
 ```

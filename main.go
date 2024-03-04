@@ -42,7 +42,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.7"
+var release string = "0.1.8"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -353,6 +353,7 @@ var helpMsg = `
       -u, --user                Username
       -p, --pass                Password
       -n, --no-pass             Disable password prompt and send no credentials
+      -i, --interactive         Start an interactive session
           --hash                Hex encoded NT Hash for user password
           --local               Authenticate as a local user instead of domain user
           --null	            Attempt null session authentication
