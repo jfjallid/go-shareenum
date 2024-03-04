@@ -42,7 +42,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.7"
+var release string = "0.1.8"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -61,7 +61,7 @@ func isFlagSet(name string) bool {
 	return found
 }
 
-func printFiles(files []smb.SharedFile) {
+func printFilesExt(files []smb.SharedFile) {
 	if len(files) > 0 {
 		for _, file := range files {
 			fileType := "file"
@@ -124,7 +124,63 @@ func filterFiles(input []smb.SharedFile) []smb.SharedFile {
 	return files
 }
 
-func downloadFiles(session *smb.Connection, share string, files []smb.SharedFile) {
+func getShares(options *localOptions, host string) (shares []string, err error) {
+	share := "IPC$"
+	err = options.c.TreeConnect(share)
+	if err != nil {
+		return
+	}
+	f, err := options.c.OpenFile(share, "srvsvc")
+	if err != nil {
+		options.c.TreeDisconnect(share)
+		return
+	}
+
+	bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	if err != nil {
+		if !options.interactive {
+			log.Errorln("Failed to bind to service")
+		}
+		f.CloseFile()
+		options.c.TreeDisconnect(share)
+		return
+	}
+	if !options.interactive {
+		log.Infoln("Successfully performed Bind to service")
+	}
+
+	result, err := bind.NetShareEnumAll(host)
+	if err != nil {
+		f.CloseFile()
+		options.c.TreeDisconnect(share)
+		return
+	}
+
+	for _, netshare := range result {
+		name := netshare.Name[:len(netshare.Name)-1]
+		if (netshare.TypeId == dcerpc.StypeDisktree) || (netshare.TypeId == dcerpc.StypeIPC) {
+			shares = append(shares, name)
+		}
+	}
+	f.CloseFile()
+	options.c.TreeDisconnect(share)
+
+	return
+}
+
+func listShares(options *localOptions, host string) {
+	shares, err := getShares(options, host)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	log.Debugf("Retrieved list of %d shares\n", len(shares))
+	for _, share := range shares {
+		fmt.Println(share)
+	}
+}
+
+func downloadFiles(session *smb.Connection, share string, files []smb.SharedFile, createDirectories bool) {
 	if len(files) > 0 {
 		for _, file := range files {
 			if file.IsDir || file.IsJunction {
@@ -164,14 +220,18 @@ func downloadFiles(session *smb.Connection, share string, files []smb.SharedFile
 				fulldir = downloadDir
 			}
 
-			err := os.MkdirAll(fulldir, 0755)
-			if err != nil {
-				log.Errorf("Failed to create dir %s with error: %v\n", err)
-				continue
+			localFile := filename
+			if createDirectories {
+				err := os.MkdirAll(fulldir, 0755)
+				if err != nil {
+					log.Errorf("Failed to create dir %s with error: %v\n", err)
+					continue
+				}
+				localFile = fulldir + string(os.PathSeparator) + filename
 			}
 
 			// Open local file in the subdir and start downloading the file
-			f, err := os.OpenFile(fulldir+string(os.PathSeparator)+filename, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
+			f, err := os.OpenFile(localFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
 			if err != nil {
 				log.Errorln(err)
 				continue
@@ -204,9 +264,9 @@ func listFilesRecursively(session *smb.Connection, share, parent, dir string) er
 	}
 
 	fmt.Printf("%s:\n", parent)
-	printFiles(files)
+	printFilesExt(files)
 	if download {
-		downloadFiles(session, share, files)
+		downloadFiles(session, share, files, true)
 	}
 
 	for _, file := range files {
@@ -257,9 +317,9 @@ func listFiles(session *smb.Connection, shares []string, recurse bool) error {
 		files = filterFiles(files)
 
 		fmt.Printf("\n#### Listing files for share (%s) ####\n", share)
-		printFiles(files)
+		printFilesExt(files)
 		if download {
-			downloadFiles(session, share, files)
+			downloadFiles(session, share, files, true)
 		}
 		if recurse {
 			for _, file := range files {
@@ -293,6 +353,7 @@ var helpMsg = `
       -u, --user                Username
       -p, --pass                Password
       -n, --no-pass             Disable password prompt and send no credentials
+      -i, --interactive         Start an interactive session
           --hash                Hex encoded NT Hash for user password
           --local               Authenticate as a local user instead of domain user
           --null	            Attempt null session authentication
@@ -324,10 +385,16 @@ var helpMsg = `
       -v, --version             Show version
 `
 
+type localOptions struct {
+	c           *smb.Connection
+	interactive bool
+	smbOptions  *smb.Options
+}
+
 func main() {
 	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksIP string
 	var port, dialTimeout, socksPort, relayPort int
-	var debug, dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, verbose, relay, noPass bool
+	var debug, dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, verbose, relay, noPass, interactive bool
 	var err error
 
 	flag.Usage = func() {
@@ -373,6 +440,8 @@ func main() {
 	flag.IntVar(&socksPort, "socks-port", 1080, "")
 	flag.BoolVar(&noPass, "no-pass", false, "")
 	flag.BoolVar(&noPass, "n", false, "")
+	flag.BoolVar(&interactive, "i", false, "")
+	flag.BoolVar(&interactive, "interactive", false, "")
 
 	flag.Parse()
 
@@ -462,7 +531,7 @@ func main() {
 		return
 	}
 
-	if !shareEnumFlag {
+	if !shareEnumFlag && !interactive {
 		if shareFlag == "" {
 			log.Errorln("Please specify a share name or the share enumeration flag.")
 			return
@@ -523,7 +592,7 @@ func main() {
 		excludedShares[part] = true
 	}
 
-	options := smb.Options{
+	smbOptions := smb.Options{
 		Host: host,
 		Port: port,
 		Initiator: &smb.NTLMInitiator{
@@ -540,14 +609,15 @@ func main() {
 
 	// Only if not using SOCKS
 	if socksIP == "" {
-		options.DialTimeout, err = time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
+		smbOptions.DialTimeout, err = time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
 		if err != nil {
 			log.Errorln(err)
 			return
 		}
 	}
 
-	var session *smb.Connection
+	var opts localOptions
+	opts.smbOptions = &smbOptions // Useful if we want to establish new connections in the shell
 
 	if socksIP != "" {
 		dialSocksProxy, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", socksIP, socksPort), nil, proxy.Direct)
@@ -555,46 +625,60 @@ func main() {
 			log.Errorln(err)
 			return
 		}
-		options.ProxyDialer = dialSocksProxy
+		smbOptions.ProxyDialer = dialSocksProxy
 	}
 
 	if relay {
-		options.RelayPort = relayPort
-		session, err = smb.NewRelayConnection(options)
+		smbOptions.RelayPort = relayPort
+		opts.c, err = smb.NewRelayConnection(smbOptions)
 	} else {
-		session, err = smb.NewConnection(options)
+		opts.c, err = smb.NewConnection(smbOptions)
 	}
 	if err != nil {
 		log.Criticalln(err)
 		return
 	}
 
-	defer session.Close()
+	defer func() {
+		if opts.c != nil {
+			opts.c.Close()
+		}
+	}()
 
-	if session.IsSigningRequired.Load() {
+	if opts.c.IsSigningRequired.Load() {
 		log.Noticeln("[-] Signing is required")
 	} else {
 		log.Noticeln("[+] Signing is NOT required")
 	}
 
-	if session.IsAuthenticated {
-		log.Noticef("[+] Login successful as %s\n", session.GetAuthUsername())
+	if opts.c.IsAuthenticated {
+		log.Noticef("[+] Login successful as %s\n", opts.c.GetAuthUsername())
 	} else {
 		log.Noticeln("[-] Login failed")
 		return
 	}
 
+	if interactive {
+		shell := newShell(&opts)
+		if shell == nil {
+			log.Errorln("Failed to start an interactive shell")
+			return
+		}
+		shell.cmdloop()
+		return
+	}
+
 	if shareEnumFlag {
 		share := "IPC$"
-		err := session.TreeConnect(share)
+		err := opts.c.TreeConnect(share)
 		if err != nil {
 			log.Errorln(err)
 			return
 		}
-		f, err := session.OpenFile(share, "srvsvc")
+		f, err := opts.c.OpenFile(share, "srvsvc")
 		if err != nil {
 			log.Errorln(err)
-			session.TreeDisconnect(share)
+			opts.c.TreeDisconnect(share)
 			return
 		}
 
@@ -603,7 +687,7 @@ func main() {
 			log.Errorln("Failed to bind to service")
 			log.Errorln(err)
 			f.CloseFile()
-			session.TreeDisconnect(share)
+			opts.c.TreeDisconnect(share)
 			return
 		}
 		log.Infoln("Successfully performed Bind to service")
@@ -612,7 +696,7 @@ func main() {
 		if err != nil {
 			log.Errorln(err)
 			f.CloseFile()
-			session.TreeDisconnect(share)
+			opts.c.TreeDisconnect(share)
 			return
 		}
 
@@ -630,13 +714,13 @@ func main() {
 			}
 		}
 		f.CloseFile()
-		session.TreeDisconnect(share)
+		opts.c.TreeDisconnect(share)
 
 		log.Debugf("Retrieved list of %d shares\n", len(shares))
 
 		fmt.Printf("\n#### %s ####\n", host)
 		if dirList {
-			err = listFiles(session, shares, recurse)
+			err = listFiles(opts.c, shares, recurse)
 			if err != nil {
 				log.Errorln(err)
 				return
@@ -650,7 +734,7 @@ func main() {
 	} else {
 		fmt.Printf("#### %s ####\n", host)
 		// Use specified list of shares
-		err = listFiles(session, shares, recurse)
+		err = listFiles(opts.c, shares, recurse)
 		if err != nil {
 			log.Errorln(err)
 			return
