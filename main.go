@@ -42,7 +42,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.8"
+var release string = "0.1.9"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -157,7 +157,7 @@ func getShares(options *localOptions, host string) (shares []string, err error) 
 	}
 
 	for _, netshare := range result {
-		name := netshare.Name[:len(netshare.Name)-1]
+		name := netshare.Name[:len(netshare.Name)]
 		if (netshare.TypeId == dcerpc.StypeDisktree) || (netshare.TypeId == dcerpc.StypeIPC) {
 			shares = append(shares, name)
 		}
@@ -645,13 +645,13 @@ func main() {
 		}
 	}()
 
-	if opts.c.IsSigningRequired.Load() {
+	if opts.c.IsSigningRequired() {
 		log.Noticeln("[-] Signing is required")
 	} else {
 		log.Noticeln("[+] Signing is NOT required")
 	}
 
-	if opts.c.IsAuthenticated {
+	if opts.c.IsAuthenticated() {
 		log.Noticef("[+] Login successful as %s\n", opts.c.GetAuthUsername())
 	} else {
 		log.Noticeln("[-] Login failed")

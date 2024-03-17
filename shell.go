@@ -712,13 +712,13 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 	}
 	switch result.Level {
 	case 101:
-		si := result.Pointer.(*dcerpc.ServerInfo101)
+		si := result.Pointer.(*dcerpc.NetServerInfo101)
 		self.printf("Version Major: %d\n", si.VersionMajor)
 		self.printf("Version Minor: %d\n", si.VersionMinor)
 		self.printf("Server Name: %s\n", si.Name)
 		self.printf("Server Comment: %s\n", si.Comment)
 	case 102:
-		si := result.Pointer.(*dcerpc.ServerInfo102)
+		si := result.Pointer.(*dcerpc.NetServerInfo102)
 		self.printf("Version Major: %d\n", si.VersionMajor)
 		self.printf("Version Minor: %d\n", si.VersionMinor)
 		self.printf("Server Name: %s\n", si.Name)
@@ -770,21 +770,21 @@ func (self *shell) getSessionsFunc(argArr interface{}) {
 	}
 	switch result.Level {
 	case 0:
-		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer)
+		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer0)
 		for i := 0; i < int(sic.EntriesRead); i++ {
-			si := sic.Buffer[i].(dcerpc.SessionInfo0)
+			si := sic.Buffer[i]
 			self.printf("host: %s\n", si.Cname)
 		}
 	case 10:
-		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer)
+		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer10)
 		for i := 0; i < int(sic.EntriesRead); i++ {
-			si := sic.Buffer[i].(dcerpc.SessionInfo10)
+			si := sic.Buffer[i]
 			self.printf("host: %s, user: %s, active: %6d, idle: %6d\n", si.Cname, si.Username, si.Time, si.IdleTime)
 		}
 	case 502:
-		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer)
+		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer502)
 		for i := 0; i < int(sic.EntriesRead); i++ {
-			si := sic.Buffer[i].(dcerpc.SessionInfo502)
+			si := sic.Buffer[i]
 			guest := si.UserFlags&0x1 == 0x1
 			noEnc := si.UserFlags&0x2 == 0x2
 
@@ -1034,8 +1034,8 @@ func (self *shell) cmdloop() {
 
 	self.t = term.NewTerminal(os.Stdin, self.prompt)
 	// Disable logging from smb library as it interferes with the terminal emulation output
-	golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
+	golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 
 OuterLoop:
