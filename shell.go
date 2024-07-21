@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
+	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 	"golang.org/x/term"
 )
@@ -56,28 +58,30 @@ type shell struct {
 
 // Inspired by Impacket's smbclient.py
 var helpMsgShell string = `Commands:
-   open <host> [port]                    - opens a new SMB connection against the target host/port
-   login [domain/username] [passwd]      - logs into the current SMB connection, no parameters for NULL connection
-   login_hash [domain/username] [nthash] - logs into the current SMB connection using the password hashes
-   logout                                - ends the current SMB session but keeps the connection
-   shares                                - list available shares
-   use <sharename>                       - connect to an specific share
-   cd <path>                             - changes the current directory to {path}
-   lcd <path>                            - changes the current local directory to {path}
-   pwd                                   - shows current remote working directory
-   ls [dir] [pattern]                    - lists files in dir filtered by pattern
-   lls [dir]                             - lists files in dir on the local filesystem
-   rm <file>                             - removes the selected file from the current directory
-   mkdir <path>                          - creates the directory specified by <path>
-   rmdir <path>                          - removes the directory specified by <path>
-   put <filename>                        - uploads the filename into the current directory
-   get <filename>                        - downloads the filename from the current directory
-   mget <mask>                           - downloads all files from the current directory matching the provided mask
-   cat <filename>                        - reads the content of <filename> and prints to stdout
-   info                                  - returns NetServerInfo results (admin gets more info)
-   who                                   - returns the sessions currently connected at the target host (admin required)
-   close                                 - closes the current SMB connection
-   exit                                  - terminates the server process (and this session)
+   open <host> [port]                     - opens a new SMB connection against the target host/port
+   login [domain/username] [passwd]       - logs into the current SMB connection, no parameters for NULL connection
+   login_hash [domain/username] [nthash]  - logs into the current SMB connection using the password hashes
+   login_krb [domain/username] [pw] [spn] - logs into the current SMB connection using Kerberos. If nothing specified, checks for CCACHE
+                                            if SPN is not specified, a hostname must have been used to open the connection.
+   logout                                 - ends the current SMB session but keeps the connection
+   shares                                 - list available shares
+   use <sharename>                        - connect to an specific share
+   cd <path>                              - changes the current directory to {path}
+   lcd <path>                             - changes the current local directory to {path}
+   pwd                                    - shows current remote working directory
+   ls [dir] [pattern]                     - lists files in dir filtered by pattern
+   lls [dir]                              - lists files in dir on the local filesystem
+   rm <file>                              - removes the selected file from the current directory
+   mkdir <path>                           - creates the directory specified by <path>
+   rmdir <path>                           - removes the directory specified by <path>
+   put <filename>                         - uploads the filename into the current directory
+   get <filename>                         - downloads the filename from the current directory
+   mget <mask>                            - downloads all files from the current directory matching the provided mask
+   cat <filename>                         - reads the content of <filename> and prints to stdout
+   info                                   - returns NetServerInfo results (admin gets more info)
+   who                                    - returns the sessions currently connected at the target host (admin required)
+   close                                  - closes the current SMB connection
+   exit                                   - terminates the server process (and this session)
 `
 
 func (self *shell) getConfirmation(s string) bool {
@@ -107,10 +111,16 @@ func mergePaths(base, target string) string {
 
 func newShell(o *localOptions) *shell {
 	s := shell{
-		options:       o,
-		prompt:        "# ",
-		rcwd:          string(filepath.Separator),
-		authenticated: true,
+		options: o,
+		prompt:  "# ",
+		rcwd:    string(filepath.Separator),
+	}
+	if !o.smbOptions.ManualLogin {
+		s.authenticated = true
+	}
+	if o.noInitialCon {
+		// Failed initial network connection or provided none
+		o.c = nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -141,6 +151,8 @@ func newShell(o *localOptions) *shell {
 	handlers["close"] = s.closeConnectionFunc
 	handlers["login"] = s.loginFunc
 	handlers["login_hash"] = s.loginHashFunc
+	handlers["login_kerberos"] = s.loginKerberosFunc
+	handlers["login_krb"] = s.loginKerberosFunc
 	handlers["logout"] = s.logoutFunc
 	return &s
 }
@@ -882,7 +894,7 @@ func (self *shell) loginFunc(argArr interface{}) {
 
 	args := argArr.([]string)
 	if len(args) < 1 {
-		err = self.options.c.SetInitiator(&smb.NTLMInitiator{
+		err = self.options.c.SetInitiator(&spnego.NTLMInitiator{
 			NullSession: true,
 		})
 	} else {
@@ -913,7 +925,7 @@ func (self *shell) loginFunc(argArr interface{}) {
 			pass = string(passBytes)
 		}
 
-		err = self.options.c.SetInitiator(&smb.NTLMInitiator{
+		err = self.options.c.SetInitiator(&spnego.NTLMInitiator{
 			User:      username,
 			Password:  pass,
 			Domain:    domain,
@@ -943,7 +955,7 @@ func (self *shell) loginHashFunc(argArr interface{}) {
 
 	args := argArr.([]string)
 	if len(args) < 1 {
-		err = self.options.c.SetInitiator(&smb.NTLMInitiator{
+		err = self.options.c.SetInitiator(&spnego.NTLMInitiator{
 			NullSession: true,
 		})
 	} else {
@@ -981,11 +993,116 @@ func (self *shell) loginHashFunc(argArr interface{}) {
 			return
 		}
 
-		err = self.options.c.SetInitiator(&smb.NTLMInitiator{
+		err = self.options.c.SetInitiator(&spnego.NTLMInitiator{
 			User:      username,
 			Hash:      hashBytes,
 			Domain:    domain,
 			LocalUser: localUser,
+		})
+	}
+
+	if err != nil {
+		self.println(err)
+		return
+	}
+
+	self.executeLogin()
+}
+
+func (self *shell) loginKerberosFunc(argArr interface{}) {
+	if self.options.c == nil {
+		self.println("Open a connection before attempting to login")
+		return
+	}
+
+	err := self.logout()
+	if err != nil {
+		self.println(err)
+		return
+	}
+
+	args := argArr.([]string)
+	if len(args) < 1 {
+		spn := ""
+		ip := net.ParseIP(self.options.smbOptions.Host)
+		if ip != nil {
+			// Ask for SPN
+			self.printf("Enter SPN (cifs/<hostname>) ")
+			input, err := self.t.ReadLine()
+			if err != nil {
+				self.println(err)
+				return
+			}
+			self.println()
+			spn = input
+		} else {
+			spn = "cifs/" + self.options.smbOptions.Host
+		}
+		self.options.c.SetInitiator(&spnego.KRB5Initiator{SPN: spn})
+	} else {
+		userdomain := args[0]
+		domain := ""
+		username := ""
+		parts := strings.Split(userdomain, "/")
+		if len(parts) > 1 {
+			domain = parts[0]
+			username = parts[1]
+		} else {
+			self.println("Invalid username")
+			return
+		}
+
+		pass := ""
+		spn := ""
+
+		ip := net.ParseIP(self.options.smbOptions.Host)
+		if len(args) > 2 {
+			pass = args[1]
+			spn = args[2]
+		} else if len(args) > 1 {
+			pass = args[1]
+			// Check if host is a hostname or ip
+			if ip == nil {
+				spn = "cifs/" + self.options.smbOptions.Host
+			} else {
+				self.printf("Enter SPN (cifs/<hostname>) ")
+				input, err := self.t.ReadLine()
+				if err != nil {
+					self.println(err)
+					return
+				}
+				self.println()
+				spn = input
+			}
+		} else {
+			self.printf("Enter password: ")
+			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+			self.println()
+			if err != nil {
+				self.println(err)
+				return
+			}
+			pass = string(passBytes)
+			// Check if host is a hostname or ip
+			if ip == nil {
+				spn = "cifs/" + self.options.smbOptions.Host
+			} else {
+				self.printf("Enter SPN (cifs/<hostname>) ")
+				input, err := self.t.ReadLine()
+				if err != nil {
+					self.println(err)
+					return
+				}
+				self.println()
+				spn = input
+			}
+		}
+
+		err = self.options.c.SetInitiator(&spnego.KRB5Initiator{
+			User:     username,
+			Password: pass,
+			Domain:   domain,
+			SPN:      spn,
 		})
 	}
 
@@ -1037,6 +1154,8 @@ func (self *shell) cmdloop() {
 	golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
+	golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
+	golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 
 OuterLoop:
 	for {
