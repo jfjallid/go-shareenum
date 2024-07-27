@@ -43,7 +43,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.2.1"
+var release string = "0.2.2"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -550,6 +550,8 @@ func main() {
 	}
 	if host != "" && targetIP == "" {
 		targetIP = host
+	} else if host == "" && targetIP != "" {
+        host = targetIP
 	}
 
 	if !shareEnumFlag && !interactive {
