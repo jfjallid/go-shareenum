@@ -36,6 +36,7 @@ import (
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
+	"github.com/jfjallid/go-smb/smb/dcerpc/mssrvs"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 	"golang.org/x/term"
@@ -53,6 +54,7 @@ type shell struct {
 	rcwd          string
 	share         string
 	authenticated bool
+	verbose       bool
 	t             *term.Terminal
 }
 
@@ -74,7 +76,7 @@ var helpMsgShell string = `Commands:
    rm <file>                              - removes the selected file from the current directory
    mkdir <path>                           - creates the directory specified by <path>
    rmdir <path>                           - removes the directory specified by <path>
-   put <filename>                         - uploads the filename into the current directory
+   put <local path> [remote path]         - uploads the filename into the current directory
    get <filename>                         - downloads the filename from the current directory
    mget <mask>                            - downloads all files from the current directory matching the provided mask
    cat <filename>                         - reads the content of <filename> and prints to stdout
@@ -154,7 +156,18 @@ func newShell(o *localOptions) *shell {
 	handlers["login_kerberos"] = s.loginKerberosFunc
 	handlers["login_krb"] = s.loginKerberosFunc
 	handlers["logout"] = s.logoutFunc
+	handlers["toggleverbose"] = s.toggleVerboseMode
 	return &s
+}
+
+func (self *shell) toggleVerboseMode(argArr interface{}) {
+	if self.verbose {
+		self.verbose = false
+		self.println("Verbose mode deactivated!")
+		return
+	}
+	self.println("Verbose mode activated!")
+	self.verbose = true
 }
 
 func (self *shell) showHelpFunc(args interface{}) {
@@ -341,7 +354,7 @@ func (self *shell) changeDirFunc(argArr interface{}) {
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid directory")
+		self.println("Please specify a target directory")
 		return
 	}
 
@@ -370,6 +383,9 @@ func (self *shell) changeDirFunc(argArr interface{}) {
 	}
 
 	self.rcwd = targetDir
+	if self.verbose {
+		self.printf("New remote workdir: %s\n", self.rcwd)
+	}
 	f.CloseFile()
 }
 
@@ -393,6 +409,9 @@ func (self *shell) changeLocalDirFunc(argArr interface{}) {
 		return
 	}
 	self.lcwd = targetDir
+	if self.verbose {
+		self.printf("New local workdir: %s\n", self.lcwd)
+	}
 }
 
 func (self *shell) mkdirFunc(argArr interface{}) {
@@ -493,6 +512,26 @@ func (self *shell) catFunc(argArr interface{}) {
 	self.printf("%s", fileChunk[:n])
 }
 
+func getFilePath(input string) (absolutePath bool, pathToFile, filename string) {
+	if input == "" {
+		return
+	}
+	if input[0] == '/' || input[0] == '\\' {
+		absolutePath = true
+	}
+	if os.PathSeparator == '\\' {
+		pathToFile = strings.ReplaceAll(input, `/`, `\`)
+	} else {
+		pathToFile = strings.ReplaceAll(input, `\`, `/`)
+	}
+	filename = filepath.Base(pathToFile)
+	if filename == "." || filename == string(os.PathSeparator) {
+		filename = ""
+		return
+	}
+	return
+}
+
 func (self *shell) getFileFunc(argArr interface{}) {
 	if !self.authenticated {
 		self.println("Not logged in!")
@@ -505,25 +544,37 @@ func (self *shell) getFileFunc(argArr interface{}) {
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid filename")
+		self.println("Must specify a filename!")
 		return
 	}
-	filename := strings.Join(args, " ")
-	if strings.ContainsAny(filename, `/\`) {
-		self.println("Invalid filename!")
+	//pathToFile := args[0]
+	absolutePath := false
+	var filename string
+	// Only one argument for this command so can allow spaces without quotes
+	pathToFile := strings.Join(args, " ")
+	// Replace all / and \ with Os.PathSeparator. Also filename is last element of pathToFile
+	absolutePath, pathToFile, filename = getFilePath(pathToFile)
+	if filename == "" {
+		self.println("Failed to determine filename from argument")
 		return
 	}
 
 	localFile := filepath.Join(self.lcwd, filename)
-	targetFile := filepath.Join(self.rcwd, filename)
+	var targetFile string
+	if absolutePath {
+		targetFile = pathToFile
+	} else {
+		targetFile = filepath.Join(self.rcwd, pathToFile)
+	}
 
-	modifiedTargetFile := strings.ReplaceAll(targetFile, `/`, `\`)[1:]
+	// Make sure we only use backslashes for Windows
+	modifiedTargetFile := strings.ReplaceAll(targetFile, `/`, `\`)[1:] // Skip first slash for absolute path
 
 	// Open local file in the subdir and start downloading the file
 	f, err := os.OpenFile(localFile, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0640)
 	if err != nil {
 		if os.IsExist(err) {
-			if !self.getConfirmation(fmt.Sprintf("The local file %s already exists. Do you want to replace it?", filename)) {
+			if !self.getConfirmation(fmt.Sprintf("The local file %q already exists. Do you want to replace it?", filename)) {
 				return
 			}
 			f, err = os.OpenFile(localFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
@@ -539,7 +590,7 @@ func (self *shell) getFileFunc(argArr interface{}) {
 
 	err = self.options.c.RetrieveFile(self.share, modifiedTargetFile, 0, f.Write)
 	if err != nil {
-		self.println(err)
+		self.printf("error retrieving file (%s): %s\n", modifiedTargetFile, err.Error())
 		f.Close()
 		return
 	}
@@ -556,30 +607,56 @@ func (self *shell) putFileFunc(argArr interface{}) {
 		self.println("Must connect to a share before attempting to upload a file!")
 		return
 	}
+	/*
+		Need to determine if first argument is relative or absolute path and extract filename
+		Need to determine if second argument is relative or absolute path and extract filename
+	*/
 
 	var err error
 	var localFile *os.File
+	var localFilename, remoteFilename, remotePath string
+	var absoluteLocalPath, absoluteRemotePath bool
 	args := argArr.([]string)
-	if len(args) == 0 {
-		self.println("Invalid filename!")
+	numArgs := len(args)
+	if numArgs == 0 {
+		self.println("Must specify a filename to upload!")
 		return
-	}
-	filename := strings.Join(args, " ")
-	if strings.ContainsAny(filename, `/\`) {
-		self.println("Invalid filename!")
-		return
+	} else if numArgs > 1 {
+		// Remote file path specified
+		remotePath = args[1]
 	}
 
-	sourceFile := filepath.Join(self.lcwd, filename)
-	remoteFile := filepath.Join(self.rcwd, filename)
+	//TODO Replace / with \ for remote path
+	//filename := strings.Join(args, " ")
+	sourceFile := args[0]
+	//sourceFile := filename
+	// Analyse local filepath
+	absoluteLocalPath, _, localFilename = getFilePath(sourceFile)
+	absoluteRemotePath, remotePath, remoteFilename = getFilePath(remotePath)
+	if localFilename == "" {
+		self.println("Failed to determine local filename from argument")
+		return
+	}
+	if remoteFilename == "" {
+		remotePath += string(os.PathSeparator) + localFilename
+	}
 
-	modifiedRemoteFile := strings.ReplaceAll(remoteFile, `/`, `\`)[1:]
+	if !absoluteLocalPath {
+		sourceFile = filepath.Join(self.lcwd, sourceFile)
+	}
+	if !absoluteRemotePath {
+		remotePath = filepath.Join(self.rcwd, remotePath)
+	}
+	// Remote paths should use Windows path separators
+	remotePath = strings.ReplaceAll(remotePath, "/", "\\")
+
+	modifiedRemoteFile := remotePath[1:] // Skip initial slash
 
 	// Check that local file exists
 	localFile, err = os.Open(sourceFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			self.println("The local filename does not exist")
+			self.printf("The local filename(%s) does not exist\n", sourceFile)
 			return
 		}
 		self.println(err)
@@ -587,6 +664,9 @@ func (self *shell) putFileFunc(argArr interface{}) {
 	}
 	defer localFile.Close()
 
+	if self.verbose {
+		self.printf("Trying to upload the local file %s to path: %s\n", sourceFile, modifiedRemoteFile)
+	}
 	// Check if remote file exists, and if so, ask before replacing it
 	createOpts := smb.NewCreateReqOpts()
 	createOpts.CreateDisp = smb.FileCreate
@@ -594,7 +674,7 @@ func (self *shell) putFileFunc(argArr interface{}) {
 	if err != nil {
 		// Check if file exists and we want to replace it
 		if err == smb.StatusMap[smb.StatusObjectNameCollision] {
-			if !self.getConfirmation(fmt.Sprintf("The remote file %s already exists. Do you want to replace it?", remoteFile)) {
+			if !self.getConfirmation(fmt.Sprintf("The remote file %q already exists. Do you want to replace it?", modifiedRemoteFile)) {
 				return
 			}
 			// Continue and replace the remote file
@@ -696,7 +776,7 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 		return
 	}
 
-	bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		self.println("Failed to bind to service")
 		self.println(err)
@@ -704,11 +784,12 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 		self.options.c.TreeDisconnect(share)
 		return
 	}
+	rpccon := mssrvs.NewRPCCon(bind)
 
-	result, err := bind.NetServerGetInfo("", 102)
+	result, err := rpccon.NetServerGetInfo("", 102)
 	if err != nil {
-		if err == dcerpc.SRVSResponseCodeMap[dcerpc.SRVSErrorAccessDenied] {
-			result, err = bind.NetServerGetInfo("", 101)
+		if err == mssrvs.SRVSResponseCodeMap[mssrvs.SRVSErrorAccessDenied] {
+			result, err = rpccon.NetServerGetInfo("", 101)
 			if err != nil {
 				self.println(err)
 				f.CloseFile()
@@ -724,13 +805,13 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 	}
 	switch result.Level {
 	case 101:
-		si := result.Pointer.(*dcerpc.NetServerInfo101)
+		si := result.Pointer.(*mssrvs.NetServerInfo101)
 		self.printf("Version Major: %d\n", si.VersionMajor)
 		self.printf("Version Minor: %d\n", si.VersionMinor)
 		self.printf("Server Name: %s\n", si.Name)
 		self.printf("Server Comment: %s\n", si.Comment)
 	case 102:
-		si := result.Pointer.(*dcerpc.NetServerInfo102)
+		si := result.Pointer.(*mssrvs.NetServerInfo102)
 		self.printf("Version Major: %d\n", si.VersionMajor)
 		self.printf("Version Minor: %d\n", si.VersionMinor)
 		self.printf("Server Name: %s\n", si.Name)
@@ -764,7 +845,7 @@ func (self *shell) getSessionsFunc(argArr interface{}) {
 		return
 	}
 
-	bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		self.println("Failed to bind to service")
 		self.println(err)
@@ -772,8 +853,9 @@ func (self *shell) getSessionsFunc(argArr interface{}) {
 		self.options.c.TreeDisconnect(share)
 		return
 	}
+	rpccon := mssrvs.NewRPCCon(bind)
 
-	result, err := bind.NetSessionEnum("", "", 10)
+	result, err := rpccon.NetSessionEnum("", "", 10)
 	if err != nil {
 		self.println(err)
 		f.CloseFile()
@@ -782,19 +864,19 @@ func (self *shell) getSessionsFunc(argArr interface{}) {
 	}
 	switch result.Level {
 	case 0:
-		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer0)
+		sic := result.SessionInfo.(*mssrvs.SessionInfoContainer0)
 		for i := 0; i < int(sic.EntriesRead); i++ {
 			si := sic.Buffer[i]
 			self.printf("host: %s\n", si.Cname)
 		}
 	case 10:
-		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer10)
+		sic := result.SessionInfo.(*mssrvs.SessionInfoContainer10)
 		for i := 0; i < int(sic.EntriesRead); i++ {
 			si := sic.Buffer[i]
 			self.printf("host: %s, user: %s, active: %6d, idle: %6d\n", si.Cname, si.Username, si.Time, si.IdleTime)
 		}
 	case 502:
-		sic := result.SessionInfo.(*dcerpc.SessionInfoContainer502)
+		sic := result.SessionInfo.(*mssrvs.SessionInfoContainer502)
 		for i := 0; i < int(sic.EntriesRead); i++ {
 			si := sic.Buffer[i]
 			guest := si.UserFlags&0x1 == 0x1
@@ -1137,6 +1219,44 @@ func (self *shell) logoutFunc(argArr interface{}) {
 	return
 }
 
+func parseArgs(input string) []string {
+	var args []string
+	var currentArg string
+	inQuotes := false
+	input = strings.TrimSpace(input)
+	// Handle escaped backslashes which is not required in interactive mode
+	input = strings.ReplaceAll(input, "\\\\", "\\")
+
+	for _, char := range input {
+		switch char {
+		case ' ':
+			if inQuotes {
+				currentArg += string(char)
+			} else {
+				if currentArg != "" {
+					args = append(args, currentArg)
+					currentArg = ""
+				}
+			}
+		case '"', '\'':
+			inQuotes = !inQuotes
+			if !inQuotes {
+				//currentArg += string(char) // Keep quotes?
+				args = append(args, currentArg)
+				currentArg = ""
+			}
+		default:
+			currentArg += string(char)
+		}
+	}
+
+	if currentArg != "" {
+		args = append(args, currentArg)
+	}
+
+	return args
+}
+
 func (self *shell) cmdloop() {
 	fmt.Println("Welcome to the interactive shell!\nType 'help' for a list of commands")
 	if useRawTerminal {
@@ -1154,6 +1274,7 @@ func (self *shell) cmdloop() {
 	golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
+	golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/mssrvs", "mssrvs", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 	golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
 
@@ -1167,19 +1288,16 @@ OuterLoop:
 			self.printf("Error reading from stdin: %s\n", err)
 			return
 		}
+		input = strings.TrimSpace(input)
 		if strings.Compare(input, "exit") == 0 {
 			break OuterLoop
 		}
-		parts := strings.Split(input, " ")
-		cmd := input
-		args := []string{}
-		if len(parts) > 1 {
-			cmd = strings.ToLower(parts[0])
-			args = parts[1:]
-		} else {
-			cmd = strings.ToLower(cmd)
+		cmd, rest, found := strings.Cut(input, " ")
+		var args []string
+		if found {
+			args = parseArgs(rest)
 		}
-
+		cmd = strings.ToLower(cmd)
 		if val, ok := handlers[cmd]; ok {
 			fn := val.(func(interface{}))
 			log.Debugf("Running command: (%s)\n", input)

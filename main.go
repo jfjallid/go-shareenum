@@ -22,12 +22,16 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,12 +42,13 @@ import (
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
+	"github.com/jfjallid/go-smb/smb/dcerpc/mssrvs"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("")
-var release string = "0.2.3"
+var release string = "0.2.4"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -137,7 +142,7 @@ func getShares(options *localOptions, host string) (shares []string, err error) 
 		return
 	}
 
-	bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		if !options.interactive {
 			log.Errorln("Failed to bind to service")
@@ -146,11 +151,12 @@ func getShares(options *localOptions, host string) (shares []string, err error) 
 		options.c.TreeDisconnect(share)
 		return
 	}
+	rpccon := mssrvs.NewRPCCon(bind)
 	if !options.interactive {
 		log.Infoln("Successfully performed Bind to service")
 	}
 
-	result, err := bind.NetShareEnumAll(host)
+	result, err := rpccon.NetShareEnumAll(host)
 	if err != nil {
 		f.CloseFile()
 		options.c.TreeDisconnect(share)
@@ -159,7 +165,7 @@ func getShares(options *localOptions, host string) (shares []string, err error) 
 
 	for _, netshare := range result {
 		name := netshare.Name[:len(netshare.Name)]
-		if (netshare.TypeId == dcerpc.StypeDisktree) || (netshare.TypeId == dcerpc.StypeIPC) {
+		if (netshare.TypeId == mssrvs.StypeDisktree) || (netshare.TypeId == mssrvs.StypeIPC) {
 			shares = append(shares, name)
 		}
 	}
@@ -250,8 +256,9 @@ func downloadFiles(session *smb.Connection, share string, files []smb.SharedFile
 	}
 }
 
-func listFilesRecursively(session *smb.Connection, share, parent, dir string) error {
+func listFilesRecursively(session *smb.Connection, share, parent, dir string, followJunctions bool) error {
 	parent = fmt.Sprintf("%s\\%s", share, parent)
+	fmt.Printf("Listing files in dir: %s\n", dir)
 	files, err := session.ListDirectory(share, dir, "*")
 	if err != nil {
 		log.Infof("Failed to list files in directory (%s) with error: %s\n", dir, err)
@@ -271,13 +278,13 @@ func listFilesRecursively(session *smb.Connection, share, parent, dir string) er
 	}
 
 	for _, file := range files {
-		if file.IsDir && !file.IsJunction {
+		if file.IsDir && (!file.IsJunction || followJunctions) {
 			// Check if folder is filtered
 			if _, ok := excludedFolders[file.Name]; ok {
 				// Skip recursing into folder
 				continue
 			}
-			err = listFilesRecursively(session, share, file.FullPath, file.FullPath)
+			err = listFilesRecursively(session, share, file.FullPath, file.FullPath, followJunctions)
 			if err != nil {
 				log.Errorln(err)
 				return err
@@ -287,7 +294,7 @@ func listFilesRecursively(session *smb.Connection, share, parent, dir string) er
 	return nil
 }
 
-func listFiles(session *smb.Connection, shares []string, recurse bool) error {
+func listFiles(session *smb.Connection, shares []string, recurse, followJunctions bool) error {
 	for _, share := range shares {
 		log.Noticef("Attempting to open share: %s and list content\n", share)
 		// Connect to share
@@ -323,14 +330,16 @@ func listFiles(session *smb.Connection, shares []string, recurse bool) error {
 			downloadFiles(session, share, files, true)
 		}
 		if recurse {
+			fmt.Printf("recusion over files [%+v]\n", files)
 			for _, file := range files {
-				if file.IsDir && !file.IsJunction {
+				fmt.Printf("Checking file: %+v\n", file)
+				if file.IsDir && (!file.IsJunction || followJunctions) {
 					// Check if folder is filtered
 					if _, ok := excludedFolders[file.Name]; ok {
 						// Skip recursing into folder
 						continue
 					}
-					err = listFilesRecursively(session, share, file.Name, file.FullPath)
+					err = listFilesRecursively(session, share, file.Name, file.FullPath, followJunctions)
 					if err != nil {
 						log.Errorln(err)
 						session.TreeDisconnect(share)
@@ -338,8 +347,72 @@ func listFiles(session *smb.Connection, shares []string, recurse bool) error {
 					}
 				}
 			}
+		} else {
+			fmt.Println("No recursion specified!")
 		}
 		session.TreeDisconnect(share)
+	}
+	return nil
+}
+
+func uploadFile(conn *smb.Connection, share, localFile, remotePath string, replaceFile bool) (err error) {
+	var f *os.File
+	filename := filepath.Base(localFile)
+	if filename == "." || filename == string(os.PathSeparator) {
+		err = fmt.Errorf("Could not determine filename for local file")
+		return
+	}
+
+	// Remote paths should use Windows path separators
+	remotePath = strings.ReplaceAll(remotePath, "/", "\\")
+
+	// Check if remotePath specifies filename
+	if remotePath[len(remotePath)-1] == '\\' {
+		remotePath += "\\" + filename
+	}
+	var modifiedRemoteFile string
+	modifiedRemoteFile = remotePath
+
+	if remotePath[0] == '\\' {
+		modifiedRemoteFile = remotePath[1:] // Skip initial slash
+	}
+
+	// Check that local file exists
+	f, err = os.Open(localFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Errorf("The local filename(%s) does not exist\n", localFile)
+			return
+		}
+		log.Errorln(err)
+		return
+	}
+	defer f.Close()
+
+	log.Infof("Trying to upload the local file %s to share: %s, path: %s\n", localFile, share, modifiedRemoteFile)
+	// Check if remote file exists
+	createOpts := smb.NewCreateReqOpts()
+	createOpts.CreateDisp = smb.FileCreate
+	f2, err := conn.OpenFileExt(share, modifiedRemoteFile, createOpts)
+	if err != nil {
+		// Check if file exists and we want to replace it
+		if err == smb.StatusMap[smb.StatusObjectNameCollision] {
+			if !replaceFile {
+				log.Errorf("The remote file %q already exists. Run with --replace to overwrite it\n", modifiedRemoteFile)
+				return
+			}
+		} else {
+			log.Errorln(err)
+			return
+		}
+	} else {
+		f2.CloseFile()
+	}
+
+	err = conn.PutFile(share, modifiedRemoteFile, 0, f.Read)
+	if err != nil {
+		log.Errorln(err)
+		return
 	}
 	return nil
 }
@@ -348,46 +421,53 @@ var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
     options:
-          --host                Hostname or ip address of remote server. Must be hostname when using Kerberos
-      -P, --port                SMB Port (default 445)
-      -d, --domain              Domain name to use for login
-      -u, --user                Username
-      -p, --pass                Password
-      -n, --no-pass             Disable password prompt and send no credentials
-      -i, --interactive         Start an interactive session
-          --hash                Hex encoded NT Hash for user password
-          --local               Authenticate as a local user instead of domain user
-          --null	            Attempt null session authentication
-      -k, --kerberos            Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
-          --dc-ip               Optionally specify ip of KDC when using Kerberos authentication
-          --target-ip           Optionally specify ip of target when using Kerberos authentication
-          --aes-key             Use a hex encoded AES128/256 key for Kerberos authentication
-      -t, --timeout             Dial timeout in seconds (default 5)
-          --enum                List available SMB shares
-          --exclude             Comma-separated list of shares to exclude
-          --list                Perform directory listing of shares
-          --shares              Comma-separated list of shares to connect to
-          --include-name        Regular expression filter for files to include in the result
-          --include-exts        Comma-separated list of file extensions to include in the result.
-                                Mutually exclusive with exclude-ext
-          --exclude-exts        Comma-separated list of file extensions to exclude from the result.
-                                Mutually exclusive with include-ext
-          --exclude-folders     Comma-separated list of folders to not traverse with recursion
-          --min-size            Minimum file size to include in results in bytes
-          --download <outdir>   Attempt to download all the files in the filtered result set.
-      -r, --recurse             Recursively list directories on server
-          --relay               Start an SMB listener that will relay incoming
-                                NTLM authentications to the remote server and
-                                use that connection. NOTE that this forces SMB 2.1
-                                without encryption.
-          --relay-port <port>   Listening port for relay (default 445)
-          --socks-host <target> Establish connection via a SOCKS5 proxy server
-          --socks-port <port>   SOCKS5 proxy port (default 1080)
-          --noenc               Disable smb encryption
-          --smb2                Force smb 2.1
-          --debug               Enable debug logging
-          --verbose             Enable verbose logging
-      -v, --version             Show version
+          --host <target>          Hostname or ip address of remote server. Must be hostname when using Kerberos
+      -P, --port <int>             SMB Port (default 445)
+      -d, --domain <name/fqdn>     Domain name to use for login
+      -u, --user <string>          Username
+      -p, --pass <string>          Password
+      -n, --no-pass                Disable password prompt and send no credentials
+      -i, --interactive            Start an interactive session
+          --hash <NT Hash>         Hex encoded NT Hash for user password
+          --local                  Authenticate as a local user instead of domain user
+          --null                   Attempt null session authentication
+      -k, --kerberos               Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
+          --dc-ip <ip>             Optionally specify ip of KDC when using Kerberos authentication
+          --target-ip <ip>         Optionally specify ip of target when using Kerberos authentication
+          --dns-host <ip:port>     Override system's default DNS resolver 
+          --dns-tcp                Force DNS lookups over TCP. Default true when using --socks-host
+          --aes-key <hex>          Use a hex encoded AES128/256 key for Kerberos authentication
+      -t, --timeout <duration>     Dial timeout specified in 5s, 1m, 10m format (default 5s)
+          --enum                   List available SMB shares
+          --exclude <list>         Comma-separated list of shares to exclude
+          --list                   Perform directory listing of shares
+          --shares <list>          Comma-separated list of shares to connect to
+          --include-name <name>    Regular expression filter for files to include in the result
+          --include-exts <list>    Comma-separated list of file extensions to include in the result.
+                                   Mutually exclusive with exclude-ext
+          --exclude-exts <list>    Comma-separated list of file extensions to exclude from the result.
+                                   Mutually exclusive with include-ext
+          --exclude-folders <list> Comma-separated list of folders to not traverse with recursion
+          --min-size <int>         Minimum file size to include in results in bytes
+          --download <outdir>      Attempt to download all the files in the filtered result set.
+      -r, --recurse                Recursively list directories on server
+          --follow-links           Follow junctions when listing files. Might lead to loops
+          --put-file               Upload --local-file to --remote-path on single share specified by --shares
+          --local-file <path>      Path to local file to upload to --remote-path
+          --remote-path <path>     Path on share specified by --shares to upload --local-file
+          --replace                Replace any existing file with same name in --remote-path
+          --relay                  Start an SMB listener that will relay incoming
+                                   NTLM authentications to the remote server and
+                                   use that connection. NOTE that this forces SMB 2.1
+                                   without encryption.
+          --relay-port <port>      Listening port for relay (default 445)
+          --socks-host <target>    Establish connection via a SOCKS5 proxy server
+          --socks-port <port>      SOCKS5 proxy port (default 1080)
+          --noenc                  Disable smb encryption
+          --smb2                   Force smb 2.1
+          --debug                  Enable debug logging
+          --verbose                Enable verbose logging
+      -v, --version                Show version
 `
 
 type localOptions struct {
@@ -398,10 +478,11 @@ type localOptions struct {
 }
 
 func main() {
-	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksIP, targetIP, dcIP, aesKey string
-	var port, dialTimeout, socksPort, relayPort int
-	var debug, dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, verbose, relay, noPass, interactive, kerberos bool
+	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksHost, targetIP, dcIP, aesKey, dnsHost, localFile, remotePath string
+	var port, socksPort, relayPort int
+	var debug, dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, verbose, relay, noPass, interactive, kerberos, dnsTCP, followJunctions, putFile, replaceFile bool
 	var err error
+	var dialTimeout time.Duration
 
 	flag.Usage = func() {
 		fmt.Println(helpMsg)
@@ -435,14 +516,14 @@ func main() {
 	flag.BoolVar(&noEnc, "noenc", false, "")
 	flag.BoolVar(&forceSMB2, "smb2", false, "")
 	flag.BoolVar(&localUser, "local", false, "")
-	flag.IntVar(&dialTimeout, "t", 5, "")
-	flag.IntVar(&dialTimeout, "timeout", 5, "")
+	flag.DurationVar(&dialTimeout, "t", 5*time.Second, "")
+	flag.DurationVar(&dialTimeout, "timeout", 5*time.Second, "")
 	flag.BoolVar(&nullSession, "null", false, "")
 	flag.BoolVar(&version, "v", false, "")
 	flag.BoolVar(&version, "version", false, "")
 	flag.BoolVar(&relay, "relay", false, "")
 	flag.IntVar(&relayPort, "relay-port", 445, "")
-	flag.StringVar(&socksIP, "socks-host", "", "")
+	flag.StringVar(&socksHost, "socks-host", "", "")
 	flag.IntVar(&socksPort, "socks-port", 1080, "")
 	flag.BoolVar(&noPass, "no-pass", false, "")
 	flag.BoolVar(&noPass, "n", false, "")
@@ -453,6 +534,13 @@ func main() {
 	flag.StringVar(&targetIP, "target-ip", "", "")
 	flag.StringVar(&dcIP, "dc-ip", "", "")
 	flag.StringVar(&aesKey, "aes-key", "", "")
+	flag.StringVar(&dnsHost, "dns-host", "", "")
+	flag.BoolVar(&dnsTCP, "dns-tcp", false, "")
+	flag.BoolVar(&followJunctions, "follow-links", false, "")
+	flag.BoolVar(&putFile, "put-file", false, "")
+	flag.BoolVar(&replaceFile, "replace", false, "")
+	flag.StringVar(&localFile, "local-file", "", "")
+	flag.StringVar(&remotePath, "remote-path", "", "")
 
 	flag.Parse()
 
@@ -488,6 +576,44 @@ func main() {
 		for _, m := range bi.Deps {
 			fmt.Printf("Package: %s, Version: %s\n", m.Path, m.Version)
 		}
+		return
+	}
+
+	// Validate format
+	if isFlagSet("dns-host") {
+		parts := strings.Split(dnsHost, ":")
+		if len(parts) < 2 {
+			if dnsHost != "" {
+				dnsHost += ":53"
+				parts = append(parts, "53")
+				log.Infof("No port number specified for --dns-host so assuming port 53")
+			} else {
+				fmt.Println("Invalid --dns-host")
+				flag.Usage()
+				return
+			}
+		}
+		ip := net.ParseIP(parts[0])
+		if ip == nil {
+			fmt.Println("Invalid --dns-host. Not a valid ip host address")
+			flag.Usage()
+			return
+		}
+		p, err := strconv.ParseUint(parts[1], 10, 32)
+		if err != nil {
+			fmt.Printf("Invalid --dns-host. Failed to parse port: %s\n", err)
+			return
+		}
+		if p < 1 {
+			fmt.Println("Invalid --dns-host port number")
+			flag.Usage()
+			return
+		}
+	}
+
+	if socksHost != "" && socksPort < 1 {
+		fmt.Println("Invalid --socks-port")
+		flag.Usage()
 		return
 	}
 
@@ -539,7 +665,7 @@ func main() {
 	}
 
 	shares := []string{}
-	netShares := []dcerpc.NetShare{}
+	netShares := []mssrvs.NetShare{}
 	var hashBytes []byte
 	var aesKeyBytes []byte
 
@@ -551,7 +677,7 @@ func main() {
 	if host != "" && targetIP == "" {
 		targetIP = host
 	} else if host == "" && targetIP != "" {
-        host = targetIP
+		host = targetIP
 	}
 
 	if !shareEnumFlag && !interactive {
@@ -561,20 +687,29 @@ func main() {
 		}
 		shares = strings.Split(shareFlag, ",")
 
-		if !dirList {
-			log.Errorln("Please specify share enum flag or list flag!")
+		if !dirList && !putFile {
+			log.Errorln("Please specify share enum flag, list flag or put-file flag!")
 			return
 		}
 	}
 
-	if socksIP != "" && isFlagSet("timeout") {
-		log.Errorln("When a socks proxy is specified, --timeout is not supported")
-		flag.Usage()
-		return
+	if putFile {
+		if len(shares) != 1 {
+			log.Errorln("Specify ONE share to upload file to with the --shares argument")
+			return
+		}
+		if localFile == "" {
+			log.Errorln("Must specify a --local-file to upload")
+			return
+		}
+		if remotePath == "" {
+			log.Errorln("Must specify a --remote-path on share to upload file to")
+			return
+		}
 	}
 
-	if dialTimeout < 1 {
-		log.Errorln("Valid value for the timeout is > 0 seconds")
+	if dialTimeout < time.Second {
+		log.Errorln("Valid value for the timeout is >= 1 seconds")
 		return
 	}
 
@@ -629,6 +764,22 @@ func main() {
 		excludedShares[part] = true
 	}
 
+	if dnsHost != "" {
+		protocol := "udp"
+		if dnsTCP {
+			protocol = "tcp"
+		}
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{
+					Timeout: dialTimeout,
+				}
+				return d.DialContext(ctx, protocol, dnsHost)
+			},
+		}
+	}
+
 	smbOptions := smb.Options{
 		Host:                  targetIP,
 		Port:                  port,
@@ -636,6 +787,14 @@ func main() {
 		ForceSMB2:             forceSMB2,
 		RequireMessageSigning: false,
 		//DisableSigning: true,
+	}
+	if socksHost != "" {
+		dialSocksProxy, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", socksHost, socksPort), nil, proxy.Direct)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		smbOptions.ProxyDialer = dialSocksProxy
 	}
 
 	if !kerberos && (hashBytes == nil) && (aesKeyBytes == nil) && (password == "") && interactive {
@@ -645,13 +804,18 @@ func main() {
 
 	if kerberos {
 		smbOptions.Initiator = &spnego.KRB5Initiator{
-			User:     username,
-			Password: password,
-			Domain:   domain,
-			Hash:     hashBytes,
-			AESKey:   aesKeyBytes,
-			SPN:      "cifs/" + host,
-			DCIP:     dcIP,
+			User:        username,
+			Password:    password,
+			Domain:      domain,
+			Hash:        hashBytes,
+			AESKey:      aesKeyBytes,
+			SPN:         "cifs/" + host,
+			DCIP:        dcIP,
+			DialTimout:  dialTimeout,
+			ProxyDialer: smbOptions.ProxyDialer,
+			DnsHost:     dnsHost,
+			DnsTCP:      dnsTCP,
+			Host:        host,
 		}
 	} else {
 		smbOptions.Initiator = &spnego.NTLMInitiator{
@@ -664,26 +828,10 @@ func main() {
 		}
 	}
 
-	// Only if not using SOCKS
-	if socksIP == "" {
-		smbOptions.DialTimeout, err = time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-	}
+	smbOptions.DialTimeout = dialTimeout
 
 	var opts localOptions
 	opts.smbOptions = &smbOptions // Useful if we want to establish new connections in the shell
-
-	if socksIP != "" {
-		dialSocksProxy, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", socksIP, socksPort), nil, proxy.Direct)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		smbOptions.ProxyDialer = dialSocksProxy
-	}
 
 	if relay {
 		smbOptions.RelayPort = relayPort
@@ -732,7 +880,20 @@ func main() {
 		return
 	}
 
-	if shareEnumFlag {
+	if putFile {
+		if strings.HasPrefix(remotePath, "c:\\") {
+			log.Infoln("Stripping prefix c:\\ from remote path")
+			remotePath = remotePath[3:]
+		}
+		log.Infof("Trying to upload local file %q to share %q, path %q\n", localFile, shares[0], remotePath)
+		err = uploadFile(opts.c, shares[0], localFile, remotePath, replaceFile)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		fmt.Println("Successfully uploaded the file")
+		return
+	} else if shareEnumFlag {
 		share := "IPC$"
 		err := opts.c.TreeConnect(share)
 		if err != nil {
@@ -746,7 +907,7 @@ func main() {
 			return
 		}
 
-		bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+		bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 		if err != nil {
 			log.Errorln("Failed to bind to service")
 			log.Errorln(err)
@@ -754,9 +915,10 @@ func main() {
 			opts.c.TreeDisconnect(share)
 			return
 		}
+		rpccon := mssrvs.NewRPCCon(bind)
 		log.Infoln("Successfully performed Bind to service")
 
-		result, err := bind.NetShareEnumAll(host)
+		result, err := rpccon.NetShareEnumAll(host)
 		if err != nil {
 			log.Errorln(err)
 			f.CloseFile()
@@ -773,7 +935,7 @@ func main() {
 				continue
 			}
 			netShares = append(netShares, netshare)
-			if netshare.TypeId == dcerpc.StypeDisktree {
+			if netshare.TypeId == mssrvs.StypeDisktree {
 				shares = append(shares, name)
 			}
 		}
@@ -784,7 +946,7 @@ func main() {
 
 		fmt.Printf("\n#### %s ####\n", host)
 		if dirList {
-			err = listFiles(opts.c, shares, recurse)
+			err = listFiles(opts.c, shares, recurse, followJunctions)
 			if err != nil {
 				log.Errorln(err)
 				return
@@ -798,7 +960,7 @@ func main() {
 	} else {
 		fmt.Printf("#### %s ####\n", host)
 		// Use specified list of shares
-		err = listFiles(opts.c, shares, recurse)
+		err = listFiles(opts.c, shares, recurse, followJunctions)
 		if err != nil {
 			log.Errorln(err)
 			return
