@@ -26,7 +26,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -34,9 +33,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jfjallid/go-smb/dcerpc"
+	"github.com/jfjallid/go-smb/dcerpc/mssrvs"
+	"github.com/jfjallid/go-smb/dcerpc/smbtransport"
 	"github.com/jfjallid/go-smb/smb"
-	"github.com/jfjallid/go-smb/smb/dcerpc"
-	"github.com/jfjallid/go-smb/smb/dcerpc/mssrvs"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 	"golang.org/x/term"
@@ -105,7 +105,6 @@ func (self *shell) getConfirmation(s string) bool {
 
 func mergePaths(base, target string) string {
 	targetDir := filepath.Join(base, target)
-	targetDir = filepath.Clean(targetDir)
 	targetDir = strings.ReplaceAll(targetDir, `\`, `/`) // Try to only have one type of separator
 	targetDir = filepath.FromSlash(targetDir)
 	return filepath.Clean(targetDir)
@@ -234,7 +233,7 @@ func (self *shell) listLocalFilesFunc(argArr interface{}) {
 	if !filepath.IsAbs(target) {
 		target = mergePaths(self.lcwd, target)
 	}
-	files, err := ioutil.ReadDir(target)
+	files, err := os.ReadDir(target)
 	if err != nil {
 		self.println(err)
 		return
@@ -290,7 +289,7 @@ func (self *shell) listFilesFunc(argArr interface{}) {
 	numArgs := len(args)
 	if numArgs > 0 {
 		lastArg := args[numArgs-1]
-		if strings.ContainsAny(string(lastArg[len(lastArg)-1]), `/\`) {
+		if len(lastArg) > 0 && strings.ContainsAny(string(lastArg[len(lastArg)-1]), `/\`) {
 			// Only path, no pattern
 			dir = strings.Join(args, " ")
 		} else {
@@ -446,7 +445,7 @@ func (self *shell) rmdirFunc(argArr interface{}) {
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before creating a new directory!")
+		self.println("Must connect to a share before removing a directory!")
 		return
 	}
 
@@ -776,7 +775,13 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 		return
 	}
 
-	bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	transport, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		self.println(err)
+		self.options.c.TreeDisconnect(share)
+		return
+	}
+	bind, err := dcerpc.Bind(transport, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		self.println("Failed to bind to service")
 		self.println(err)
@@ -845,7 +850,14 @@ func (self *shell) getSessionsFunc(argArr interface{}) {
 		return
 	}
 
-	bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	transport, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		self.println(err)
+		self.options.c.TreeDisconnect(share)
+		return
+	}
+
+	bind, err := dcerpc.Bind(transport, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		self.println("Failed to bind to service")
 		self.println(err)
@@ -1201,7 +1213,7 @@ func (self *shell) logout() error {
 		return nil
 	}
 	self.share = ""
-	self.rcwd = ""
+	self.rcwd = string(filepath.Separator)
 	self.lcwd = ""
 	self.authenticated = false
 	return self.options.c.Logoff()
@@ -1289,7 +1301,7 @@ OuterLoop:
 			return
 		}
 		input = strings.TrimSpace(input)
-		if strings.Compare(input, "exit") == 0 {
+		if input == "exit" {
 			break OuterLoop
 		}
 		cmd, rest, found := strings.Cut(input, " ")

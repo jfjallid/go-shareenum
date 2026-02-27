@@ -40,15 +40,16 @@ import (
 	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 
+	"github.com/jfjallid/go-smb/dcerpc"
+	"github.com/jfjallid/go-smb/dcerpc/mssrvs"
+	"github.com/jfjallid/go-smb/dcerpc/smbtransport"
 	"github.com/jfjallid/go-smb/smb"
-	"github.com/jfjallid/go-smb/smb/dcerpc"
-	"github.com/jfjallid/go-smb/smb/dcerpc/mssrvs"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("")
-var release string = "0.2.5"
+var release string = "0.3.0"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -141,8 +142,13 @@ func getShares(options *localOptions, host string) (shares []string, err error) 
 		options.c.TreeDisconnect(share)
 		return
 	}
+	transport, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
 
-	bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	bind, err := dcerpc.Bind(transport, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		if !options.interactive {
 			log.Errorln("Failed to bind to service")
@@ -164,7 +170,7 @@ func getShares(options *localOptions, host string) (shares []string, err error) 
 	}
 
 	for _, netshare := range result {
-		name := netshare.Name[:len(netshare.Name)]
+		name := netshare.Name
 		if (netshare.TypeId == mssrvs.StypeDisktree) || (netshare.TypeId == mssrvs.StypeIPC) {
 			shares = append(shares, name)
 		}
@@ -200,24 +206,24 @@ func downloadFiles(session *smb.Connection, share string, files []smb.SharedFile
 				continue
 			}
 			// Determine full relative file path
-			filepath := path.Clean(file.FullPath)
-			if path.IsAbs(filepath) {
+			cleanedPath := path.Clean(file.FullPath)
+			if path.IsAbs(cleanedPath) {
 				// Could this be bypassed to escape to an absolute path?
-				filepath = strings.TrimPrefix(filepath, string(os.PathSeparator))
+				cleanedPath = strings.TrimPrefix(cleanedPath, string(os.PathSeparator))
 			}
 
 			if os.PathSeparator == '\\' {
-				filepath = strings.ReplaceAll(filepath, "/", "\\")
+				cleanedPath = strings.ReplaceAll(cleanedPath, "/", "\\")
 			} else {
-				filepath = strings.ReplaceAll(filepath, "\\", "/")
+				cleanedPath = strings.ReplaceAll(cleanedPath, "\\", "/")
 			}
-			/* This does not work properly if the separator in the filepath
+			/* This does not work properly if the separator in the cleanedPath
 			 * differs from the os specific path separator e.g., if the windows
 			 * path is share\dir1\file and the client os is linux with a default
 			 * path separator of /, then the Split function will fail to split
 			 * the filename from the path.
 			 */
-			dir, filename := path.Split(filepath)
+			dir, filename := path.Split(cleanedPath)
 
 			// Create sub folders if they do not already exist
 			fulldir := ""
@@ -231,7 +237,7 @@ func downloadFiles(session *smb.Connection, share string, files []smb.SharedFile
 			if createDirectories {
 				err := os.MkdirAll(fulldir, 0755)
 				if err != nil {
-					log.Errorf("Failed to create dir %s with error: %v\n", err)
+					log.Errorf("Failed to create dir %s with error: %v\n", fulldir, err)
 					continue
 				}
 				localFile = fulldir + string(os.PathSeparator) + filename
@@ -294,8 +300,12 @@ func listFilesRecursively(session *smb.Connection, share, parent, dir string, fo
 	return nil
 }
 
-func listFiles(session *smb.Connection, shares []string, recurse, followJunctions bool) error {
+func listFiles(session *smb.Connection, shares []string, recurse, followJunctions bool, startDir string) error {
 	for _, share := range shares {
+		// Normalize: forward slashes to backslashes, strip leading/trailing separators
+		dir := strings.ReplaceAll(startDir, "/", `\`)
+		dir = strings.Trim(dir, `\`)
+
 		log.Noticef("Attempting to open share: %s and list content\n", share)
 		// Connect to share
 		err := session.TreeConnect(share)
@@ -307,7 +317,7 @@ func listFiles(session *smb.Connection, shares []string, recurse, followJunction
 			log.Errorln(err)
 			continue
 		}
-		files, err := session.ListDirectory(share, "", "")
+		files, err := session.ListDirectory(share, dir, "")
 		if err != nil {
 
 			if err == smb.StatusMap[smb.StatusAccessDenied] {
@@ -324,15 +334,19 @@ func listFiles(session *smb.Connection, shares []string, recurse, followJunction
 		// Remove filtered files
 		files = filterFiles(files)
 
-		fmt.Printf("\n#### Listing files for share (%s) ####\n", share)
+		if dir != "" {
+			fmt.Printf("\n#### Listing files for share (%s\\%s) ####\n", share, dir)
+		} else {
+			fmt.Printf("\n#### Listing files for share (%s) ####\n", share)
+		}
 		printFilesExt(files)
 		if download {
 			downloadFiles(session, share, files, true)
 		}
 		if recurse {
-			fmt.Printf("recusion over files [%+v]\n", files)
+			log.Debugf("recursion over files [%+v]\n", files)
 			for _, file := range files {
-				fmt.Printf("Checking file: %+v\n", file)
+				log.Debugf("Checking file: %+v\n", file)
 				if file.IsDir && (!file.IsJunction || followJunctions) {
 					// Check if folder is filtered
 					if _, ok := excludedFolders[file.Name]; ok {
@@ -365,6 +379,11 @@ func uploadFile(conn *smb.Connection, share, localFile, remotePath string, repla
 
 	// Remote paths should use Windows path separators
 	remotePath = strings.ReplaceAll(remotePath, "/", "\\")
+
+	if remotePath == "" {
+		err = fmt.Errorf("remote path must not be empty")
+		return
+	}
 
 	// Check if remotePath specifies filename
 	if remotePath[len(remotePath)-1] == '\\' {
@@ -454,7 +473,8 @@ var helpMsg = `
           --follow-links           Follow junctions when listing files. Might lead to loops
           --put-file               Upload --local-file to --remote-path on single share specified by --shares
           --local-file <path>      Path to local file to upload to --remote-path
-          --remote-path <path>     Path on share specified by --shares to upload --local-file
+          --remote-path <path>     Path on share specified by --shares to upload --local-file,
+                                   or starting directory for --list (default: share root)
           --replace                Replace any existing file with same name in --remote-path
           --relay                  Start an SMB listener that will relay incoming
                                    NTLM authentications to the remote server and
@@ -635,7 +655,7 @@ func main() {
 	}
 
 	if includeExt != "" && excludeExt != "" {
-		log.Errorln("--include-ext and --exclude-ext are mutually exclusive, so don't supply both!")
+		log.Errorln("--include-exts and --exclude-exts are mutually exclusive, so don't supply both!")
 		flag.Usage()
 		return
 	}
@@ -644,7 +664,7 @@ func main() {
 		includedExts = make(map[string]interface{})
 		exts := strings.Split(includeExt, ",")
 		for _, e := range exts {
-			includedExts[e] = nil
+			includedExts[strings.TrimPrefix(strings.TrimSpace(e), ".")] = nil
 		}
 	}
 
@@ -652,7 +672,7 @@ func main() {
 		excludedExts = make(map[string]interface{})
 		exts := strings.Split(excludeExt, ",")
 		for _, e := range exts {
-			excludedExts[e] = nil
+			excludedExts[strings.TrimPrefix(strings.TrimSpace(e), ".")] = nil
 		}
 	}
 
@@ -660,7 +680,7 @@ func main() {
 		excludedFolders = make(map[string]interface{})
 		folders := strings.Split(excludeFolder, ",")
 		for _, f := range folders {
-			excludedFolders[f] = nil
+			excludedFolders[strings.TrimSpace(f)] = nil
 		}
 	}
 
@@ -743,7 +763,7 @@ func main() {
 		if (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) {
 			if (username != "") && (!nullSession) {
 				// Check if password is already specified to be empty
-				if !isFlagSet("P") && !isFlagSet("pass") {
+				if !isFlagSet("p") && !isFlagSet("pass") {
 					fmt.Printf("Enter password: ")
 					passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 					fmt.Println()
@@ -811,7 +831,7 @@ func main() {
 			AESKey:      aesKeyBytes,
 			SPN:         "cifs/" + host,
 			DCIP:        dcIP,
-			DialTimout:  dialTimeout,
+			DialTimeout: dialTimeout,
 			ProxyDialer: smbOptions.ProxyDialer,
 			DnsHost:     dnsHost,
 			DnsTCP:      dnsTCP,
@@ -853,15 +873,16 @@ func main() {
 		}
 	}()
 
-	if opts.c.IsSigningRequired() {
-		log.Noticeln("[-] Signing is required")
-	} else {
-		log.Noticeln("[+] Signing is NOT required")
+	if opts.c != nil {
+		if opts.c.IsSigningRequired() {
+			log.Noticeln("[-] Signing is required")
+		} else {
+			log.Noticeln("[+] Signing is NOT required")
+		}
 	}
 
 	if interactive {
-		if !opts.c.IsAuthenticated() {
-			// Login failed
+		if opts.c != nil && !opts.c.IsAuthenticated() {
 			opts.smbOptions.ManualLogin = true
 		}
 		shell := newShell(&opts)
@@ -870,6 +891,11 @@ func main() {
 			return
 		}
 		shell.cmdloop()
+		return
+	}
+
+	if opts.c == nil {
+		log.Noticeln("[-] Connection failed")
 		return
 	}
 
@@ -907,7 +933,12 @@ func main() {
 			return
 		}
 
-		bind, err := dcerpc.Bind(f, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+		transport, err := smbtransport.NewSMBTransport(f)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		bind, err := dcerpc.Bind(transport, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 		if err != nil {
 			log.Errorln("Failed to bind to service")
 			log.Errorln(err)
@@ -929,7 +960,7 @@ func main() {
 		// Replace list of shares when doing enumeration
 		shares = []string{}
 		for _, netshare := range result {
-			name := netshare.Name[:len(netshare.Name)]
+			name := netshare.Name
 			if _, ok := excludedShares[name]; ok {
 				// Exclude share
 				continue
@@ -946,7 +977,7 @@ func main() {
 
 		fmt.Printf("\n#### %s ####\n", host)
 		if dirList {
-			err = listFiles(opts.c, shares, recurse, followJunctions)
+			err = listFiles(opts.c, shares, recurse, followJunctions, remotePath)
 			if err != nil {
 				log.Errorln(err)
 				return
@@ -960,7 +991,7 @@ func main() {
 	} else {
 		fmt.Printf("#### %s ####\n", host)
 		// Use specified list of shares
-		err = listFiles(opts.c, shares, recurse, followJunctions)
+		err = listFiles(opts.c, shares, recurse, followJunctions, remotePath)
 		if err != nil {
 			log.Errorln(err)
 			return
