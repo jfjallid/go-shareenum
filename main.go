@@ -31,6 +31,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -43,12 +44,14 @@ import (
 	"github.com/jfjallid/go-smb/dcerpc"
 	"github.com/jfjallid/go-smb/dcerpc/mssrvs"
 	"github.com/jfjallid/go-smb/dcerpc/smbtransport"
+	"github.com/jfjallid/go-smb/msdtyp"
 	"github.com/jfjallid/go-smb/smb"
+	"github.com/jfjallid/go-smb/relay"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 )
 
-var log = golog.Get("")
+var log = golog.Get("main")
 var release string = "0.3.0"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
@@ -178,6 +181,112 @@ func getShares(options *localOptions, host string) (shares []string, err error) 
 	f.CloseFile()
 	options.c.TreeDisconnect(share)
 
+	return
+}
+
+// formatUses renders a SHARE_INFO uses counter, mapping the "no limit"
+// sentinel (0xffffffff) to a readable string.
+func formatUses(v uint32) string {
+	if v == 0xffffffff {
+		return "unlimited"
+	}
+	return strconv.FormatUint(uint64(v), 10)
+}
+
+// appendNetShare writes a human-readable representation of ns at the given info
+// level to sb. Higher levels add more fields: level 501 adds the share flags and
+// level 502 additionally carries the permissions, usage counters, on-disk path
+// and the share's security descriptor.
+func appendNetShare(sb *strings.Builder, ns *mssrvs.NetShare, level int) {
+	fmt.Fprintf(sb, "Name: %s\n", ns.Name)
+	fmt.Fprintf(sb, "Type: %s\n", ns.Type)
+	fmt.Fprintf(sb, "Comment: %s\n", ns.Comment)
+	switch level {
+	case 501:
+		fmt.Fprintf(sb, "Flags: 0x%08x\n", ns.Flags)
+	case 502:
+		fmt.Fprintf(sb, "Permissions: 0x%08x\n", ns.Permissions)
+		fmt.Fprintf(sb, "Max Uses: %s\n", formatUses(ns.MaxUses))
+		fmt.Fprintf(sb, "Current Uses: %d\n", ns.CurrentUses)
+		fmt.Fprintf(sb, "Path: %s\n", ns.Path)
+		if ns.SecurityDescriptor != nil {
+			fmt.Fprintln(sb, "Security descriptor:")
+			appendSecurityDescriptor(sb, ns.SecurityDescriptor)
+		}
+	}
+}
+
+// appendSecurityDescriptor writes a human-readable representation of sd to sb.
+// SIDs are shown in their raw string form as this tool does not resolve them.
+func appendSecurityDescriptor(sb *strings.Builder, sd *msdtyp.SecurityDescriptor) {
+	if sd == nil {
+		return
+	}
+	if sd.OwnerSid != nil {
+		fmt.Fprintf(sb, "OwnerSid: %s\n", sd.OwnerSid.ToString())
+	}
+	if sd.GroupSid != nil {
+		fmt.Fprintf(sb, "GroupSid: %s\n", sd.GroupSid.ToString())
+	}
+	if sd.Dacl != nil {
+		fmt.Fprintln(sb, "DACL entries:")
+		appendAceEntries(sb, sd.Dacl.ACLS)
+	}
+	if sd.Sacl != nil {
+		fmt.Fprintln(sb, "SACL entries:")
+		appendAceEntries(sb, sd.Sacl.ACLS)
+	}
+}
+
+// appendAceEntries writes the ACE entries of an ACL to sb.
+func appendAceEntries(sb *strings.Builder, aces []msdtyp.ACE) {
+	for _, ace := range aces {
+		item := ace.Permissions()
+		fmt.Fprintf(sb, "AceType: %s\nAceFlags: %s\nSid: %s\n", item.AceType, item.AceFlagStrings, item.Sid)
+		sb.WriteString("Permissions: ")
+		sb.WriteString(strings.Join(item.Permissions, ","))
+		sb.WriteString("\n\n")
+	}
+}
+
+// getSharesFormatted enumerates the shares on host at the given info level
+// (1, 501 or 502) and returns one formatted block per share. Unlike getShares
+// it returns every share regardless of type, with the detail the level carries.
+func getSharesFormatted(options *localOptions, host string, level int) (lines []string, err error) {
+	share := "IPC$"
+	err = options.c.TreeConnect(share)
+	if err != nil {
+		return
+	}
+	defer options.c.TreeDisconnect(share)
+	f, err := options.c.OpenFile(share, "srvsvc")
+	if err != nil {
+		return
+	}
+	defer f.CloseFile()
+	transport, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	bind, err := dcerpc.Bind(transport, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
+	if err != nil {
+		if !options.interactive {
+			log.Errorln("Failed to bind to service")
+		}
+		return
+	}
+	rpccon := mssrvs.NewRPCCon(bind)
+
+	netshares, err := rpccon.NetShareEnumAllExt(host, level)
+	if err != nil {
+		return
+	}
+	for i := range netshares {
+		var sb strings.Builder
+		appendNetShare(&sb, &netshares[i], level)
+		lines = append(lines, sb.String())
+	}
 	return
 }
 
@@ -453,11 +562,14 @@ var helpMsg = `
       -k, --kerberos               Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
           --dc-ip <ip>             Optionally specify ip of KDC when using Kerberos authentication
           --target-ip <ip>         Optionally specify ip of target when using Kerberos authentication
-          --dns-host <ip:port>     Override system's default DNS resolver 
+          --dns-host <ip:port>     Override system's default DNS resolver
           --dns-tcp                Force DNS lookups over TCP. Default true when using --socks-host
           --aes-key <hex>          Use a hex encoded AES128/256 key for Kerberos authentication
       -t, --timeout <duration>     Dial timeout specified in 5s, 1m, 10m format (default 5s)
           --enum                   List available SMB shares
+          --level <int>            Info level for --enum: 1, 501 or 502 (default 1).
+                                   Higher levels add the share flags (501) and the
+                                   permissions, path and security descriptor (502)
           --exclude <list>         Comma-separated list of shares to exclude
           --list                   Perform directory listing of shares
           --shares <list>          Comma-separated list of shares to connect to
@@ -476,6 +588,11 @@ var helpMsg = `
           --remote-path <path>     Path on share specified by --shares to upload --local-file,
                                    or starting directory for --list (default: share root)
           --replace                Replace any existing file with same name in --remote-path
+      -c "<cmd1>; <cmd2>"          Run semicolon-separated commands non-interactively, then exit.
+                                   Commands match the interactive shell. No escape syntax for ';';
+                                   use --script for commands containing literal semicolons.
+          --script <file>          Run commands from <file> (one per line; blank lines and lines
+                                   starting with '#' are ignored). Same command set as -c.
           --relay                  Start an SMB listener that will relay incoming
                                    NTLM authentications to the remote server and
                                    use that connection. NOTE that this forces SMB 2.1
@@ -485,8 +602,16 @@ var helpMsg = `
           --socks-port <port>      SOCKS5 proxy port (default 1080)
           --noenc                  Disable smb encryption
           --smb2                   Force smb 2.1
-          --debug                  Enable debug logging
-          --verbose                Enable verbose logging
+          --debug                  Enable debug logging. Bare --debug turns on every
+                                   registered package; --debug=smb,relay turns on only the
+                                   listed package-name suffixes (the '=' form is required
+                                   for the filter).
+          --verbose                Enable verbose logging. Same filter syntax as --debug.
+                                   --debug and --verbose may be combined with different
+                                   filters; a package targeted by both gets the higher level.
+          --list-log-packages      List the registered log package names that can be
+                                   targeted with --debug=<suffix> or --verbose=<suffix>,
+                                   then exit
       -v, --version                Show version
 `
 
@@ -497,10 +622,64 @@ type localOptions struct {
 	smbOptions   *smb.Options
 }
 
+// logFlag is a comma-separated package-suffix filter that also remembers
+// whether the user passed the flag at all. IsBoolFlag is set so the bare
+// "--debug" and "--verbose" form parses (flag pkg then calls Set("true"))
+// — we treat "true" as "no filter, all packages on". A filter list requires
+// the "=" form, e.g. --debug=smb,relay, because IsBoolFlag stops the parser
+// from consuming the next positional token.
+type logFlag struct {
+	set    bool
+	values []string
+}
+
+func (d *logFlag) String() string { return strings.Join(d.values, ",") }
+
+func (d *logFlag) IsBoolFlag() bool { return true }
+
+func (d *logFlag) Set(s string) error {
+	d.set = true
+	d.values = nil
+	if s == "" || s == "true" {
+		return nil
+	}
+	for _, tok := range strings.Split(s, ",") {
+		if tok = strings.TrimSpace(tok); tok != "" {
+			d.values = append(d.values, tok)
+		}
+	}
+	return nil
+}
+
+// applyLogLevel bumps registered package loggers to level. An empty filter
+// matches every name returned by golog.Names(); a non-empty filter keeps only
+// names whose path suffix matches one of the tokens (see matchesAny).
+func applyLogLevel(level int, filter []string) {
+	flags := golog.LstdFlags | golog.Lshortfile
+	for _, name := range golog.Names() {
+		if len(filter) == 0 || matchesAny(name, filter) {
+			golog.Set(name, "", level, flags, nil, nil)
+		}
+	}
+}
+
+// matchesAny reports whether name equals any token or ends with "/"+token,
+// so "smb" hits ".../go-smb/smb" but not ".../go-smb" (ends in "/go-smb",
+// not "/smb") and not ".../smb/server" (ends in "/server").
+func matchesAny(name string, tokens []string) bool {
+	for _, t := range tokens {
+		if name == t || strings.HasSuffix(name, "/"+t) {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
-	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksHost, targetIP, dcIP, aesKey, dnsHost, localFile, remotePath string
-	var port, socksPort, relayPort int
-	var debug, dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, verbose, relay, noPass, interactive, kerberos, dnsTCP, followJunctions, putFile, replaceFile bool
+	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksHost, targetIP, dcIP, aesKey, dnsHost, localFile, remotePath, batchCmd, scriptFile string
+	var port, socksPort, relayPort, level int
+	var dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, doRelay, noPass, interactive, kerberos, dnsTCP, followJunctions, putFile, replaceFile, listLogPackages bool
+	var debug, verbose logFlag
 	var err error
 	var dialTimeout time.Duration
 
@@ -519,13 +698,14 @@ func main() {
 	flag.StringVar(&domain, "domain", "", "")
 	flag.IntVar(&port, "P", 445, "")
 	flag.IntVar(&port, "port", 445, "")
-	flag.BoolVar(&debug, "debug", false, "")
-	flag.BoolVar(&verbose, "verbose", false, "")
+	flag.Var(&debug, "debug", "")
+	flag.Var(&verbose, "verbose", "")
 	flag.StringVar(&shareFlag, "shares", "", "")
 	flag.BoolVar(&dirList, "list", false, "")
 	flag.BoolVar(&recurse, "r", false, "")
 	flag.BoolVar(&recurse, "recurse", false, "")
 	flag.BoolVar(&shareEnumFlag, "enum", false, "")
+	flag.IntVar(&level, "level", 1, "")
 	flag.StringVar(&excludeShareFlag, "exclude", "", "")
 	flag.StringVar(&includeName, "include-name", "", "")
 	flag.StringVar(&includeExt, "include-exts", "", "")
@@ -541,7 +721,8 @@ func main() {
 	flag.BoolVar(&nullSession, "null", false, "")
 	flag.BoolVar(&version, "v", false, "")
 	flag.BoolVar(&version, "version", false, "")
-	flag.BoolVar(&relay, "relay", false, "")
+	flag.BoolVar(&listLogPackages, "list-log-packages", false, "")
+	flag.BoolVar(&doRelay, "relay", false, "")
 	flag.IntVar(&relayPort, "relay-port", 445, "")
 	flag.StringVar(&socksHost, "socks-host", "", "")
 	flag.IntVar(&socksPort, "socks-port", 1080, "")
@@ -561,30 +742,41 @@ func main() {
 	flag.BoolVar(&replaceFile, "replace", false, "")
 	flag.StringVar(&localFile, "local-file", "", "")
 	flag.StringVar(&remotePath, "remote-path", "", "")
+	flag.StringVar(&batchCmd, "c", "", "")
+	flag.StringVar(&scriptFile, "script", "", "")
 
 	flag.Parse()
 
-	if debug {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
-		log.SetLogLevel(golog.LevelDebug)
-	} else if verbose {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		log.SetLogLevel(golog.LevelInfo)
-	} else {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+	if listLogPackages {
+		// The package loggers are registered at import time, so golog.Names()
+		// here lists every logger this binary can target. The suffix of any of
+		// these names (a path segment) is what --debug=/--verbose= matches.
+		names := golog.Names()
+		sort.Strings(names)
+		fmt.Println("Registered log packages (target a name's suffix with --debug=<suffix> or --verbose=<suffix>):")
+		for _, name := range names {
+			fmt.Println(name)
+		}
+		return
+	}
+
+	// --debug and --verbose are not mutually exclusive: each may carry its own
+	// comma-separated package filter (e.g. --debug=smb,relay --verbose=main).
+	// Verbose is applied first and debug second so that any package targeted by
+	// both ends up at the higher level (LevelDebug > LevelInfo). A bare --debug
+	// or --verbose (empty filter) targets every registered package, so passing
+	// both bare is ambiguous and rejected.
+	if debug.set || verbose.set {
+		if debug.set && verbose.set && len(debug.values) == 0 && len(verbose.values) == 0 {
+			fmt.Println("Cannot enable both --debug and --verbose for all packages at once. Specify just one of them, or be more granular e.g. --debug=smb,relay --verbose=main")
+			return
+		}
+		if verbose.set {
+			applyLogLevel(golog.LevelInfo, verbose.values)
+		}
+		if debug.set {
+			applyLogLevel(golog.LevelDebug, debug.values)
+		}
 	}
 
 	if version {
@@ -700,7 +892,17 @@ func main() {
 		host = targetIP
 	}
 
-	if !shareEnumFlag && !interactive {
+	batch := batchCmd != "" || scriptFile != ""
+	if batchCmd != "" && scriptFile != "" {
+		log.Errorln("-c and --script are mutually exclusive")
+		return
+	}
+	if batch && (interactive || shareEnumFlag || dirList || putFile) {
+		log.Errorln("Batch mode (-c/--script) is mutually exclusive with --interactive, --enum, --list, and --put-file")
+		return
+	}
+
+	if !shareEnumFlag && !interactive && !batch {
 		if shareFlag == "" {
 			log.Errorln("Please specify a share name or the share enumeration flag.")
 			return
@@ -709,6 +911,19 @@ func main() {
 
 		if !dirList && !putFile {
 			log.Errorln("Please specify share enum flag, list flag or put-file flag!")
+			return
+		}
+	}
+
+	if isFlagSet("level") {
+		if !shareEnumFlag {
+			log.Errorln("--level can only be used together with --enum")
+			return
+		}
+		switch level {
+		case 1, 501, 502:
+		default:
+			log.Errorln("Invalid --level for --enum (supported: 1, 501, 502)")
 			return
 		}
 	}
@@ -805,7 +1020,7 @@ func main() {
 		Port:                  port,
 		DisableEncryption:     noEnc,
 		ForceSMB2:             forceSMB2,
-		RequireMessageSigning: false,
+		//RequireMessageSigning: true,
 		//DisableSigning: true,
 	}
 	if socksHost != "" {
@@ -853,9 +1068,13 @@ func main() {
 	var opts localOptions
 	opts.smbOptions = &smbOptions // Useful if we want to establish new connections in the shell
 
-	if relay {
-		smbOptions.RelayPort = relayPort
-		opts.c, err = smb.NewRelayConnection(smbOptions)
+	if doRelay {
+		relayConf := relay.ClientConfig{
+			ListenAddr: fmt.Sprintf(":%d", relayPort),
+			Target: fmt.Sprintf("%s:445", targetIP),
+			UpstreamOptions: smbOptions,
+		}
+		opts.c, _, err = relay.RelayClient(relayConf)
 	} else {
 		opts.c, err = smb.NewConnection(smbOptions)
 	}
@@ -906,6 +1125,15 @@ func main() {
 		return
 	}
 
+	if batch {
+		rc := runBatchMode(&opts, batchCmd, scriptFile, debug.set, verbose.set)
+		if opts.c != nil {
+			opts.c.Close()
+			opts.c = nil
+		}
+		os.Exit(rc)
+	}
+
 	if putFile {
 		if strings.HasPrefix(remotePath, "c:\\") {
 			log.Infoln("Stripping prefix c:\\ from remote path")
@@ -949,7 +1177,7 @@ func main() {
 		rpccon := mssrvs.NewRPCCon(bind)
 		log.Infoln("Successfully performed Bind to service")
 
-		result, err := rpccon.NetShareEnumAll(host)
+		result, err := rpccon.NetShareEnumAllExt(host, level)
 		if err != nil {
 			log.Errorln(err)
 			f.CloseFile()
@@ -984,8 +1212,17 @@ func main() {
 			}
 		} else {
 			fmt.Printf("\nShares:\n")
-			for _, share := range netShares {
-				fmt.Printf("Name: %s\nComment: %s\nHidden: %v\nType: %s\n\n", share.Name, share.Comment, share.Hidden, share.Type)
+			if isFlagSet("level") {
+				// Detailed enumeration with the fields the chosen level carries.
+				for i := range netShares {
+					var sb strings.Builder
+					appendNetShare(&sb, &netShares[i], level)
+					fmt.Println(sb.String())
+				}
+			} else {
+				for _, share := range netShares {
+					fmt.Printf("Name: %s\nComment: %s\nHidden: %v\nType: %s\n\n", share.Name, share.Comment, share.Hidden, share.Type)
+				}
 			}
 		}
 	} else {

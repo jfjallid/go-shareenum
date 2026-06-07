@@ -55,6 +55,8 @@ type shell struct {
 	share         string
 	authenticated bool
 	verbose       bool
+	batch         bool
+	cmdFailed     bool
 	t             *term.Terminal
 }
 
@@ -66,7 +68,7 @@ var helpMsgShell string = `Commands:
    login_krb [domain/username] [pw] [spn] - logs into the current SMB connection using Kerberos. If nothing specified, checks for CCACHE
                                             if SPN is not specified, a hostname must have been used to open the connection.
    logout                                 - ends the current SMB session but keeps the connection
-   shares                                 - list available shares
+   shares [level]                         - list available shares. Optional level (1, 501, 502) shows detailed info
    use <sharename>                        - connect to an specific share
    cd <path>                              - changes the current directory to {path}
    lcd <path>                             - changes the current local directory to {path}
@@ -87,6 +89,10 @@ var helpMsgShell string = `Commands:
 `
 
 func (self *shell) getConfirmation(s string) bool {
+	if self.batch {
+		self.printf("%s [y/n]: y (auto)\n", s)
+		return true
+	}
 	self.t.SetPrompt("")
 	defer self.t.SetPrompt(self.prompt)
 
@@ -101,6 +107,21 @@ func (self *shell) getConfirmation(s string) bool {
 		return true
 	}
 	return false
+}
+
+func (self *shell) recordErr(err error) {
+	self.println(err.Error())
+	self.cmdFailed = true
+}
+
+func (self *shell) recordErrMsg(msg string) {
+	self.println(msg)
+	self.cmdFailed = true
+}
+
+func (self *shell) recordErrf(format string, a ...any) {
+	self.printf(format, a...)
+	self.cmdFailed = true
 }
 
 func mergePaths(base, target string) string {
@@ -173,24 +194,52 @@ func (self *shell) showHelpFunc(args interface{}) {
 	self.println(helpMsgShell)
 }
 
-func (self *shell) listSharesFunc(args interface{}) {
+func (self *shell) listSharesFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
-	shares, err := getShares(self.options, "")
+	args := argArr.([]string)
+	if len(args) == 0 {
+		// Default behaviour: list the names of disk and IPC shares.
+		shares, err := getShares(self.options, "")
+		if err != nil {
+			self.recordErr(err)
+			return
+		}
+		for _, share := range shares {
+			self.println(share)
+		}
+		return
+	}
+
+	// An optional level argument switches to a detailed enumeration of all
+	// shares with the extra fields that the chosen info level carries.
+	level, err := strconv.ParseInt(args[0], 10, 32)
 	if err != nil {
-		self.println(err)
+		self.recordErrMsg("Error parsing level. Usage: shares [level]")
 		return
 	}
-	for _, share := range shares {
-		self.println(share)
+	switch level {
+	case 1, 501, 502:
+	default:
+		self.recordErrMsg("Must specify a valid level (1, 501 or 502)")
+		return
+	}
+
+	lines, err := getSharesFormatted(self.options, "", int(level))
+	if err != nil {
+		self.recordErr(err)
+		return
+	}
+	for _, item := range lines {
+		self.println(item)
 	}
 }
 
 func (self *shell) printCWDFunc(args interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
@@ -206,18 +255,18 @@ func (self *shell) printLocalCWDFunc(args interface{}) {
 
 func (self *shell) useShareFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	args := argArr.([]string)
 
 	if len(args) != 1 {
-		self.println("Must specify a share name with 'use' command")
+		self.recordErrMsg("Must specify a share name with 'use' command")
 		return
 	}
 	err := self.options.c.TreeConnect(args[0])
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 	}
 	self.share = args[0]
 	self.rcwd = string(filepath.Separator)
@@ -235,7 +284,7 @@ func (self *shell) listLocalFilesFunc(argArr interface{}) {
 	}
 	files, err := os.ReadDir(target)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	for _, f := range files {
@@ -264,11 +313,11 @@ func (self *shell) printFiles(files []smb.SharedFile) {
 
 func (self *shell) listFilesFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before listing files!")
+		self.recordErrMsg("Must connect to a share before listing files!")
 		return
 	}
 
@@ -332,10 +381,10 @@ func (self *shell) listFilesFunc(argArr interface{}) {
 	files, err := self.options.c.ListDirectory(self.share, dir, pattern)
 	if err != nil {
 		if err == smb.StatusMap[smb.StatusAccessDenied] {
-			self.println("Listing files was prohibited!")
+			self.recordErrMsg("Listing files was prohibited!")
 			return
 		}
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	self.printFiles(files)
@@ -343,11 +392,11 @@ func (self *shell) listFilesFunc(argArr interface{}) {
 
 func (self *shell) changeDirFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before changing working directory!")
+		self.recordErrMsg("Must connect to a share before changing working directory!")
 		return
 	}
 
@@ -377,7 +426,7 @@ func (self *shell) changeDirFunc(argArr interface{}) {
 
 	f, err := self.options.c.OpenFileExt(self.share, modifiedTargetDir, createOpts)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 
@@ -391,7 +440,7 @@ func (self *shell) changeDirFunc(argArr interface{}) {
 func (self *shell) changeLocalDirFunc(argArr interface{}) {
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid directory")
+		self.recordErrMsg("Invalid directory")
 		return
 	}
 	targetDir := strings.Join(args, " ")
@@ -404,7 +453,7 @@ func (self *shell) changeLocalDirFunc(argArr interface{}) {
 
 	err := os.Chdir(targetDir)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	self.lcwd = targetDir
@@ -415,17 +464,17 @@ func (self *shell) changeLocalDirFunc(argArr interface{}) {
 
 func (self *shell) mkdirFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before creating a new directory!")
+		self.recordErrMsg("Must connect to a share before creating a new directory!")
 		return
 	}
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid directory")
+		self.recordErrMsg("Invalid directory")
 		return
 	}
 
@@ -434,24 +483,24 @@ func (self *shell) mkdirFunc(argArr interface{}) {
 	modifiedTargetDir := strings.ReplaceAll(targetDir, `/`, `\`)[1:]
 	err := self.options.c.Mkdir(self.share, modifiedTargetDir)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 }
 
 func (self *shell) rmdirFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before removing a directory!")
+		self.recordErrMsg("Must connect to a share before removing a directory!")
 		return
 	}
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid directory")
+		self.recordErrMsg("Invalid directory")
 		return
 	}
 
@@ -460,29 +509,29 @@ func (self *shell) rmdirFunc(argArr interface{}) {
 	modifiedTargetDir := strings.ReplaceAll(targetDir, `/`, `\`)[1:]
 	err := self.options.c.DeleteDir(self.share, modifiedTargetDir)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 }
 
 func (self *shell) catFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before attempting to read a file!")
+		self.recordErrMsg("Must connect to a share before attempting to read a file!")
 		return
 	}
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid filename")
+		self.recordErrMsg("Invalid filename")
 		return
 	}
 	filename := strings.Join(args, " ")
 	if strings.ContainsAny(filename, `/\`) {
-		self.println("Invalid filename!")
+		self.recordErrMsg("Invalid filename!")
 		return
 	}
 
@@ -491,7 +540,7 @@ func (self *shell) catFunc(argArr interface{}) {
 	modifiedTargetFile := strings.ReplaceAll(targetFile, `/`, `\`)[1:]
 	f, err := self.options.c.OpenFile(self.share, modifiedTargetFile)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	chunkSize := 2048
@@ -505,7 +554,7 @@ func (self *shell) catFunc(argArr interface{}) {
 	fileChunk := make([]byte, chunkSize)
 	n, err := f.ReadFile(fileChunk, 0)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	self.printf("%s", fileChunk[:n])
@@ -533,17 +582,17 @@ func getFilePath(input string) (absolutePath bool, pathToFile, filename string) 
 
 func (self *shell) getFileFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before attempting to download a file!")
+		self.recordErrMsg("Must connect to a share before attempting to download a file!")
 		return
 	}
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Must specify a filename!")
+		self.recordErrMsg("Must specify a filename!")
 		return
 	}
 	//pathToFile := args[0]
@@ -554,7 +603,7 @@ func (self *shell) getFileFunc(argArr interface{}) {
 	// Replace all / and \ with Os.PathSeparator. Also filename is last element of pathToFile
 	absolutePath, pathToFile, filename = getFilePath(pathToFile)
 	if filename == "" {
-		self.println("Failed to determine filename from argument")
+		self.recordErrMsg("Failed to determine filename from argument")
 		return
 	}
 
@@ -578,18 +627,18 @@ func (self *shell) getFileFunc(argArr interface{}) {
 			}
 			f, err = os.OpenFile(localFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
 			if err != nil {
-				self.println(err)
+				self.recordErr(err)
 				return
 			}
 		} else {
-			self.println(err)
+			self.recordErr(err)
 			return
 		}
 	}
 
 	err = self.options.c.RetrieveFile(self.share, modifiedTargetFile, 0, f.Write)
 	if err != nil {
-		self.printf("error retrieving file (%s): %s\n", modifiedTargetFile, err.Error())
+		self.recordErrf("error retrieving file (%s): %s\n", modifiedTargetFile, err.Error())
 		f.Close()
 		return
 	}
@@ -598,12 +647,12 @@ func (self *shell) getFileFunc(argArr interface{}) {
 
 func (self *shell) putFileFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 
 	if self.share == "" {
-		self.println("Must connect to a share before attempting to upload a file!")
+		self.recordErrMsg("Must connect to a share before attempting to upload a file!")
 		return
 	}
 	/*
@@ -618,7 +667,7 @@ func (self *shell) putFileFunc(argArr interface{}) {
 	args := argArr.([]string)
 	numArgs := len(args)
 	if numArgs == 0 {
-		self.println("Must specify a filename to upload!")
+		self.recordErrMsg("Must specify a filename to upload!")
 		return
 	} else if numArgs > 1 {
 		// Remote file path specified
@@ -633,7 +682,7 @@ func (self *shell) putFileFunc(argArr interface{}) {
 	absoluteLocalPath, _, localFilename = getFilePath(sourceFile)
 	absoluteRemotePath, remotePath, remoteFilename = getFilePath(remotePath)
 	if localFilename == "" {
-		self.println("Failed to determine local filename from argument")
+		self.recordErrMsg("Failed to determine local filename from argument")
 		return
 	}
 	if remoteFilename == "" {
@@ -655,10 +704,10 @@ func (self *shell) putFileFunc(argArr interface{}) {
 	localFile, err = os.Open(sourceFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			self.printf("The local filename(%s) does not exist\n", sourceFile)
+			self.recordErrf("The local filename(%s) does not exist\n", sourceFile)
 			return
 		}
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	defer localFile.Close()
@@ -678,7 +727,7 @@ func (self *shell) putFileFunc(argArr interface{}) {
 			}
 			// Continue and replace the remote file
 		} else {
-			self.println(err)
+			self.recordErr(err)
 			return
 		}
 	} else {
@@ -687,30 +736,30 @@ func (self *shell) putFileFunc(argArr interface{}) {
 
 	err = self.options.c.PutFile(self.share, modifiedRemoteFile, 0, localFile.Read)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 }
 
 func (self *shell) rmFileFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before attempting to delete a file!")
+		self.recordErrMsg("Must connect to a share before attempting to delete a file!")
 		return
 	}
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid filename")
+		self.recordErrMsg("Invalid filename")
 		return
 	}
 	// Only allow filenames and not paths
 	filename := strings.Join(args, " ")
 	if strings.ContainsAny(filename, `/\`) {
-		self.println("Invalid filename!")
+		self.recordErrMsg("Invalid filename!")
 		return
 	}
 
@@ -719,30 +768,30 @@ func (self *shell) rmFileFunc(argArr interface{}) {
 
 	err := self.options.c.DeleteFile(self.share, modifiedTargetFile)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 	}
 	return
 }
 
 func (self *shell) maskGetFilesFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.share == "" {
-		self.println("Must connect to a share before attempting to download files!")
+		self.recordErrMsg("Must connect to a share before attempting to download files!")
 		return
 	}
 
 	args := argArr.([]string)
 	if len(args) == 0 {
-		self.println("Invalid mask")
+		self.recordErrMsg("Invalid mask")
 		return
 	}
 
 	pattern := strings.Join(args, " ")
 	if strings.ContainsAny(pattern, `/\`) {
-		self.println("Invalid mask")
+		self.recordErrMsg("Invalid mask")
 		return
 	}
 
@@ -751,7 +800,7 @@ func (self *shell) maskGetFilesFunc(argArr interface{}) {
 	downloadDir = self.lcwd
 	files, err := self.options.c.ListDirectory(self.share, modifiedRCWD, pattern)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	downloadFiles(self.options.c, self.share, files, false)
@@ -759,32 +808,32 @@ func (self *shell) maskGetFilesFunc(argArr interface{}) {
 
 func (self *shell) getServerInfoFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	share := "IPC$"
 	err := self.options.c.TreeConnect(share)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	f, err := self.options.c.OpenFile(share, "srvsvc")
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		self.options.c.TreeDisconnect(share)
 		return
 	}
 
 	transport, err := smbtransport.NewSMBTransport(f)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		self.options.c.TreeDisconnect(share)
 		return
 	}
 	bind, err := dcerpc.Bind(transport, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
-		self.println("Failed to bind to service")
-		self.println(err)
+		self.recordErrMsg("Failed to bind to service")
+		self.recordErr(err)
 		f.CloseFile()
 		self.options.c.TreeDisconnect(share)
 		return
@@ -796,13 +845,13 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 		if err == mssrvs.SRVSResponseCodeMap[mssrvs.SRVSErrorAccessDenied] {
 			result, err = rpccon.NetServerGetInfo("", 101)
 			if err != nil {
-				self.println(err)
+				self.recordErr(err)
 				f.CloseFile()
 				self.options.c.TreeDisconnect(share)
 				return
 			}
 		} else {
-			self.println(err)
+			self.recordErr(err)
 			f.CloseFile()
 			self.options.c.TreeDisconnect(share)
 			return
@@ -810,13 +859,13 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 	}
 	switch result.Level {
 	case 101:
-		si := result.Pointer.(*mssrvs.NetServerInfo101)
+		si := result.Level101
 		self.printf("Version Major: %d\n", si.VersionMajor)
 		self.printf("Version Minor: %d\n", si.VersionMinor)
 		self.printf("Server Name: %s\n", si.Name)
 		self.printf("Server Comment: %s\n", si.Comment)
 	case 102:
-		si := result.Pointer.(*mssrvs.NetServerInfo102)
+		si := result.Level102
 		self.printf("Version Major: %d\n", si.VersionMajor)
 		self.printf("Version Minor: %d\n", si.VersionMinor)
 		self.printf("Server Name: %s\n", si.Name)
@@ -834,33 +883,33 @@ func (self *shell) getServerInfoFunc(argArr interface{}) {
 
 func (self *shell) getSessionsFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	share := "IPC$"
 	err := self.options.c.TreeConnect(share)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	f, err := self.options.c.OpenFile(share, "srvsvc")
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		self.options.c.TreeDisconnect(share)
 		return
 	}
 
 	transport, err := smbtransport.NewSMBTransport(f)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		self.options.c.TreeDisconnect(share)
 		return
 	}
 
 	bind, err := dcerpc.Bind(transport, mssrvs.MSRPCUuidSrvSvc, 3, 0, dcerpc.MSRPCUuidNdr)
 	if err != nil {
-		self.println("Failed to bind to service")
-		self.println(err)
+		self.recordErrMsg("Failed to bind to service")
+		self.recordErr(err)
 		f.CloseFile()
 		self.options.c.TreeDisconnect(share)
 		return
@@ -869,26 +918,26 @@ func (self *shell) getSessionsFunc(argArr interface{}) {
 
 	result, err := rpccon.NetSessionEnum("", "", 10)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		f.CloseFile()
 		self.options.c.TreeDisconnect(share)
 		return
 	}
 	switch result.Level {
 	case 0:
-		sic := result.SessionInfo.(*mssrvs.SessionInfoContainer0)
+		sic := result.Level0
 		for i := 0; i < int(sic.EntriesRead); i++ {
 			si := sic.Buffer[i]
 			self.printf("host: %s\n", si.Cname)
 		}
 	case 10:
-		sic := result.SessionInfo.(*mssrvs.SessionInfoContainer10)
+		sic := result.Level10
 		for i := 0; i < int(sic.EntriesRead); i++ {
 			si := sic.Buffer[i]
 			self.printf("host: %s, user: %s, active: %6d, idle: %6d\n", si.Cname, si.Username, si.Time, si.IdleTime)
 		}
 	case 502:
-		sic := result.SessionInfo.(*mssrvs.SessionInfoContainer502)
+		sic := result.Level502
 		for i := 0; i < int(sic.EntriesRead); i++ {
 			si := sic.Buffer[i]
 			guest := si.UserFlags&0x1 == 0x1
@@ -914,7 +963,7 @@ func (self *shell) openConnectionFunc(argArr interface{}) {
 	}
 	args := argArr.([]string)
 	if len(args) < 1 {
-		self.println("Invalid arguments. Expected host and optionally a port parameter")
+		self.recordErrMsg("Invalid arguments. Expected host and optionally a port parameter")
 		return
 	}
 	host := args[0]
@@ -923,11 +972,11 @@ func (self *shell) openConnectionFunc(argArr interface{}) {
 		portStr := args[1]
 		port, err = strconv.Atoi(portStr)
 		if err != nil {
-			self.printf("Failed to parse port as number: %s\n", err)
+			self.recordErrf("Failed to parse port as number: %s\n", err)
 			return
 		}
 		if port < 1 || port > 65535 {
-			self.println("Invalid port!")
+			self.recordErrMsg("Invalid port!")
 			return
 		}
 	}
@@ -938,7 +987,7 @@ func (self *shell) openConnectionFunc(argArr interface{}) {
 	self.options.smbOptions.ManualLogin = true
 	self.options.c, err = smb.NewConnection(*self.options.smbOptions)
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		self.options.c = nil
 		return
 	}
@@ -966,7 +1015,7 @@ func (self *shell) closeConnectionFunc(argArr interface{}) {
 func (self *shell) executeLogin() {
 	err := self.options.c.SessionSetup()
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 	self.authenticated = true
@@ -982,7 +1031,7 @@ func (self *shell) loginFunc(argArr interface{}) {
 
 	err := self.logout()
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 
@@ -1013,7 +1062,7 @@ func (self *shell) loginFunc(argArr interface{}) {
 			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			self.println()
 			if err != nil {
-				self.println(err)
+				self.recordErr(err)
 				return
 			}
 			pass = string(passBytes)
@@ -1028,7 +1077,7 @@ func (self *shell) loginFunc(argArr interface{}) {
 	}
 
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 
@@ -1043,7 +1092,7 @@ func (self *shell) loginHashFunc(argArr interface{}) {
 
 	err := self.logout()
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 
@@ -1076,14 +1125,14 @@ func (self *shell) loginHashFunc(argArr interface{}) {
 			hashStringBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			self.println()
 			if err != nil {
-				self.println(err)
+				self.recordErr(err)
 				return
 			}
 			hash = string(hashStringBytes)
 		}
 		hashBytes, err = hex.DecodeString(hash)
 		if err != nil {
-			self.println(err)
+			self.recordErr(err)
 			return
 		}
 
@@ -1096,7 +1145,7 @@ func (self *shell) loginHashFunc(argArr interface{}) {
 	}
 
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 
@@ -1111,7 +1160,7 @@ func (self *shell) loginKerberosFunc(argArr interface{}) {
 
 	err := self.logout()
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 
@@ -1124,7 +1173,7 @@ func (self *shell) loginKerberosFunc(argArr interface{}) {
 			self.printf("Enter SPN (cifs/<hostname>) ")
 			input, err := self.t.ReadLine()
 			if err != nil {
-				self.println(err)
+				self.recordErr(err)
 				return
 			}
 			self.println()
@@ -1142,7 +1191,7 @@ func (self *shell) loginKerberosFunc(argArr interface{}) {
 			domain = parts[0]
 			username = parts[1]
 		} else {
-			self.println("Invalid username")
+			self.recordErrMsg("Invalid username")
 			return
 		}
 
@@ -1162,7 +1211,7 @@ func (self *shell) loginKerberosFunc(argArr interface{}) {
 				self.printf("Enter SPN (cifs/<hostname>) ")
 				input, err := self.t.ReadLine()
 				if err != nil {
-					self.println(err)
+					self.recordErr(err)
 					return
 				}
 				self.println()
@@ -1173,7 +1222,7 @@ func (self *shell) loginKerberosFunc(argArr interface{}) {
 			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			self.println()
 			if err != nil {
-				self.println(err)
+				self.recordErr(err)
 				return
 			}
 			pass = string(passBytes)
@@ -1184,7 +1233,7 @@ func (self *shell) loginKerberosFunc(argArr interface{}) {
 				self.printf("Enter SPN (cifs/<hostname>) ")
 				input, err := self.t.ReadLine()
 				if err != nil {
-					self.println(err)
+					self.recordErr(err)
 					return
 				}
 				self.println()
@@ -1201,7 +1250,7 @@ func (self *shell) loginKerberosFunc(argArr interface{}) {
 	}
 
 	if err != nil {
-		self.println(err)
+		self.recordErr(err)
 		return
 	}
 
@@ -1221,7 +1270,7 @@ func (self *shell) logout() error {
 
 func (self *shell) logoutFunc(argArr interface{}) {
 	if !self.authenticated {
-		self.println("Not logged in!")
+		self.recordErrMsg("Not logged in!")
 		return
 	}
 	if self.options.c == nil {
@@ -1275,20 +1324,22 @@ func (self *shell) cmdloop() {
 		// Unfortunately we can't capture signals like ctrl-c or ctrl-d in RawMode
 		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
-			self.println(err)
+			self.recordErr(err)
 			return
 		}
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
 	self.t = term.NewTerminal(os.Stdin, self.prompt)
-	// Disable logging from smb library as it interferes with the terminal emulation output
-	golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
-	golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
-	golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
-	golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/mssrvs", "mssrvs", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
-	golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
-	golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
+	// Disable logging from the smb library as it interferes with the terminal
+	// emulation output. golog.Names() enumerates every registered package
+	// logger; skip our own "main" logger so its notices still surface.
+	for _, name := range golog.Names() {
+		if name == "main" {
+			continue
+		}
+		golog.Set(name, "", golog.LevelNone, 0, golog.NoOutput, golog.NoOutput)
+	}
 
 OuterLoop:
 	for {

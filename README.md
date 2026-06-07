@@ -10,46 +10,70 @@ and provides functionality to list SMB shares and enumerate the files.
 Usage: ./go-shareenum [options]
 
 options:
-      --host                Hostname or ip address of remote server. Must be hostname when using Kerberos
-  -P, --port                SMB Port (default 445)
-  -d, --domain              Domain name to use for login
-  -u, --user                Username
-  -p, --pass                Password
-  -n, --no-pass             Disable password prompt and send no credentials
-  -i, --interactive         Start an interactive session
-      --hash                Hex encoded NT Hash for user password
-      --local               Authenticate as a local user instead of domain user
-      --null	            Attempt null session authentication
-  -k, --kerberos            Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
-      --dc-ip               Optionally specify ip of KDC when using Kerberos authentication
-      --target-ip           Optionally specify ip of target when using Kerberos authentication
-      --aes-key             Use a hex encoded AES128/256 key for Kerberos authentication
-  -t, --timeout             Dial timeout in seconds (default 5)
-      --enum                List available SMB shares
-      --exclude             Comma-separated list of shares to exclude
-      --list                Perform directory listing of shares
-      --shares              Comma-separated list of shares to connect to
-      --include-name        Regular expression filter for files to include in the result
-      --include-exts        Comma-separated list of file extensions to include in the result.
-                            Mutually exclusive with exclude-ext
-      --exclude-exts        Comma-separated list of file extensions to exclude from the result.
-                            Mutually exclusive with include-ext
-      --exclude-folders     Comma-separated list of folders to not traverse with recursion
-      --min-size            Minimum file size to include in results in bytes
-      --download <outdir>   Attempt to download all the files in the filtered result set.
-  -r, --recurse             Recursively list directories on server
-      --relay               Start an SMB listener that will relay incoming
-                            NTLM authentications to the remote server and
-                            use that connection. NOTE that this forces SMB 2.1
-                            without encryption.
-      --relay-port <port>   Listening port for relay (default 445)
-      --socks-host <target> Establish connection via a SOCKS5 proxy server
-      --socks-port <port>   SOCKS5 proxy port (default 1080)
-      --noenc               Disable smb encryption
-      --smb2                Force smb 2.1
-      --debug               Enable debug logging
-      --verbose             Enable verbose logging
-  -v, --version             Show version
+      --host <target>          Hostname or ip address of remote server. Must be hostname when using Kerberos
+  -P, --port <int>             SMB Port (default 445)
+  -d, --domain <name/fqdn>     Domain name to use for login
+  -u, --user <string>          Username
+  -p, --pass <string>          Password
+  -n, --no-pass                Disable password prompt and send no credentials
+  -i, --interactive            Start an interactive session
+      --hash <NT Hash>         Hex encoded NT Hash for user password
+      --local                  Authenticate as a local user instead of domain user
+      --null                   Attempt null session authentication
+  -k, --kerberos               Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
+      --dc-ip <ip>             Optionally specify ip of KDC when using Kerberos authentication
+      --target-ip <ip>         Optionally specify ip of target when using Kerberos authentication
+      --dns-host <ip:port>     Override system's default DNS resolver
+      --dns-tcp                Force DNS lookups over TCP. Default true when using --socks-host
+      --aes-key <hex>          Use a hex encoded AES128/256 key for Kerberos authentication
+  -t, --timeout <duration>     Dial timeout specified in 5s, 1m, 10m format (default 5s)
+      --enum                   List available SMB shares
+      --level <int>            Info level for --enum: 1, 501 or 502 (default 1).
+                               Higher levels add the share flags (501) and the
+                               permissions, path and security descriptor (502)
+      --exclude <list>         Comma-separated list of shares to exclude
+      --list                   Perform directory listing of shares
+      --shares <list>          Comma-separated list of shares to connect to
+      --include-name <name>    Regular expression filter for files to include in the result
+      --include-exts <list>    Comma-separated list of file extensions to include in the result.
+                               Mutually exclusive with exclude-ext
+      --exclude-exts <list>    Comma-separated list of file extensions to exclude from the result.
+                               Mutually exclusive with include-ext
+      --exclude-folders <list> Comma-separated list of folders to not traverse with recursion
+      --min-size <int>         Minimum file size to include in results in bytes
+      --download <outdir>      Attempt to download all the files in the filtered result set.
+  -r, --recurse                Recursively list directories on server
+      --follow-links           Follow junctions when listing files. Might lead to loops
+      --put-file               Upload --local-file to --remote-path on single share specified by --shares
+      --local-file <path>      Path to local file to upload to --remote-path
+      --remote-path <path>     Path on share specified by --shares to upload --local-file,
+                               or starting directory for --list (default: share root)
+      --replace                Replace any existing file with same name in --remote-path
+  -c "<cmd1>; <cmd2>"          Run semicolon-separated commands non-interactively, then exit.
+                               Commands match the interactive shell. No escape syntax for ';';
+                               use --script for commands containing literal semicolons.
+      --script <file>          Run commands from <file> (one per line; blank lines and lines
+                               starting with '#' are ignored). Same command set as -c.
+      --relay                  Start an SMB listener that will relay incoming
+                               NTLM authentications to the remote server and
+                               use that connection. NOTE that this forces SMB 2.1
+                               without encryption.
+      --relay-port <port>      Listening port for relay (default 445)
+      --socks-host <target>    Establish connection via a SOCKS5 proxy server
+      --socks-port <port>      SOCKS5 proxy port (default 1080)
+      --noenc                  Disable smb encryption
+      --smb2                   Force smb 2.1
+      --debug                  Enable debug logging. Bare --debug turns on every
+                               registered package; --debug=smb,relay turns on only the
+                               listed package-name suffixes (the '=' form is required
+                               for the filter).
+      --verbose                Enable verbose logging. Same filter syntax as --debug.
+                               --debug and --verbose may be combined with different
+                               filters; a package targeted by both gets the higher level.
+      --list-log-packages      List the registered log package names that can be
+                               targeted with --debug=<suffix> or --verbose=<suffix>,
+                               then exit
+  -v, --version                Show version
 ```
 
 ## Examples
