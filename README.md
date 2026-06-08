@@ -26,6 +26,8 @@ options:
       --dns-host <ip:port>     Override system's default DNS resolver
       --dns-tcp                Force DNS lookups over TCP. Default true when using --socks-host
       --aes-key <hex>          Use a hex encoded AES128/256 key for Kerberos authentication
+      --keytab-file <file>     Authenticate using keys from a keytab file (implies -k). User and
+                               domain are taken from the first keytab entry if not specified
   -t, --timeout <duration>     Dial timeout specified in 5s, 1m, 10m format (default 5s)
       --enum                   List available SMB shares
       --level <int>            Info level for --enum: 1, 501 or 502 (default 1).
