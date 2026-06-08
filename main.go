@@ -48,11 +48,12 @@ import (
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/relay"
 	"github.com/jfjallid/go-smb/spnego"
+	"github.com/jfjallid/gokrb5/v9/keytab"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("main")
-var release string = "0.3.0"
+var release string = "0.4.1"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -565,6 +566,8 @@ var helpMsg = `
           --dns-host <ip:port>     Override system's default DNS resolver
           --dns-tcp                Force DNS lookups over TCP. Default true when using --socks-host
           --aes-key <hex>          Use a hex encoded AES128/256 key for Kerberos authentication
+          --keytab-file <file>     Authenticate using keys from a keytab file (implies -k). User and
+                                   domain are taken from the first keytab entry if not specified
       -t, --timeout <duration>     Dial timeout specified in 5s, 1m, 10m format (default 5s)
           --enum                   List available SMB shares
           --level <int>            Info level for --enum: 1, 501 or 502 (default 1).
@@ -676,7 +679,7 @@ func matchesAny(name string, tokens []string) bool {
 }
 
 func main() {
-	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksHost, targetIP, dcIP, aesKey, dnsHost, localFile, remotePath, batchCmd, scriptFile string
+	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksHost, targetIP, dcIP, aesKey, dnsHost, localFile, remotePath, batchCmd, scriptFile, keytabFile string
 	var port, socksPort, relayPort, level int
 	var dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, doRelay, noPass, interactive, kerberos, dnsTCP, followJunctions, putFile, replaceFile, listLogPackages bool
 	var debug, verbose logFlag
@@ -735,6 +738,7 @@ func main() {
 	flag.StringVar(&targetIP, "target-ip", "", "")
 	flag.StringVar(&dcIP, "dc-ip", "", "")
 	flag.StringVar(&aesKey, "aes-key", "", "")
+	flag.StringVar(&keytabFile, "keytab-file", "", "")
 	flag.StringVar(&dnsHost, "dns-host", "", "")
 	flag.BoolVar(&dnsTCP, "dns-tcp", false, "")
 	flag.BoolVar(&followJunctions, "follow-links", false, "")
@@ -970,12 +974,19 @@ func main() {
 		}
 	}
 
+	// A keytab is a Kerberos credential, so authenticating with one implies -k.
+	if keytabFile != "" {
+		kerberos = true
+	}
+
 	if noPass {
 		password = ""
 		hashBytes = nil
 		aesKeyBytes = nil
 	} else {
-		if (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) {
+		// A keytab is a valid credential source, so don't prompt for a password
+		// when one is supplied.
+		if (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) && (keytabFile == "") {
 			if (username != "") && (!nullSession) {
 				// Check if password is already specified to be empty
 				if !isFlagSet("p") && !isFlagSet("pass") {
@@ -1038,7 +1049,7 @@ func main() {
 	}
 
 	if kerberos {
-		smbOptions.Initiator = &spnego.KRB5Initiator{
+		krbInitiator := &spnego.KRB5Initiator{
 			User:        username,
 			Password:    password,
 			Domain:      domain,
@@ -1052,6 +1063,17 @@ func main() {
 			DnsTCP:      dnsTCP,
 			Host:        host,
 		}
+		if keytabFile != "" {
+			// The initiator authenticates from the keytab and derives a missing
+			// User/Domain from its first entry.
+			kt, kerr := keytab.Load(keytabFile)
+			if kerr != nil {
+				log.Errorf("Failed to load keytab file %s: %s\n", keytabFile, kerr)
+				return
+			}
+			krbInitiator.Keytab = kt
+		}
+		smbOptions.Initiator = krbInitiator
 	} else {
 		smbOptions.Initiator = &spnego.NTLMInitiator{
 			User:        username,
