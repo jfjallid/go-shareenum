@@ -24,6 +24,7 @@ package main
 import (
 	"bufio"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -380,7 +381,7 @@ func (self *shell) listFilesFunc(argArr interface{}) {
 
 	files, err := self.options.c.ListDirectory(self.share, dir, pattern)
 	if err != nil {
-		if err == smb.StatusMap[smb.StatusAccessDenied] {
+		if errors.Is(err, smb.StatusMap[smb.StatusAccessDenied]) {
 			self.recordErrMsg("Listing files was prohibited!")
 			return
 		}
@@ -721,7 +722,7 @@ func (self *shell) putFileFunc(argArr interface{}) {
 	f, err := self.options.c.OpenFileExt(self.share, modifiedRemoteFile, createOpts)
 	if err != nil {
 		// Check if file exists and we want to replace it
-		if err == smb.StatusMap[smb.StatusObjectNameCollision] {
+		if errors.Is(err, smb.StatusMap[smb.StatusObjectNameCollision]) {
 			if !self.getConfirmation(fmt.Sprintf("The remote file %q already exists. Do you want to replace it?", modifiedRemoteFile)) {
 				return
 			}

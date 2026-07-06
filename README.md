@@ -47,10 +47,15 @@ options:
   -r, --recurse                Recursively list directories on server
       --follow-links           Follow junctions when listing files. Might lead to loops
       --put-file               Upload --local-file to --remote-path on single share specified by --shares
-      --local-file <path>      Path to local file to upload to --remote-path
+      --get-file               Download --remote-path from single share specified by --shares to
+                               --local-file (defaults to the remote filename in the cwd)
+      --local-file <path>      Path to local file to upload to --remote-path (--put-file), or
+                               local destination for a --get-file download (optional for --get-file)
       --remote-path <path>     Path on share specified by --shares to upload --local-file,
-                               or starting directory for --list (default: share root)
-      --replace                Replace any existing file with same name in --remote-path
+                               file to download with --get-file, or starting directory for
+                               --list (default: share root)
+      --replace                Replace any existing file with same name in --remote-path when
+                               uploading, or the existing local file when downloading
   -c "<cmd1>; <cmd2>"          Run semicolon-separated commands non-interactively, then exit.
                                Commands match the interactive shell. No escape syntax for ';';
                                use --script for commands containing literal semicolons.
@@ -109,4 +114,24 @@ options:
 
 ```
 ./go-shareenum --host server001 --user Administrator --pass adminPass123 --interactive
+```
+
+### Upload a local file to a share
+
+```
+./go-shareenum --host server001 --user Administrator --pass adminPass123 --shares backup --put-file --local-file ./report.txt --remote-path "\reports\report.txt"
+```
+
+### Download a single file from a share
+
+Saves to the remote filename in the current directory when --local-file is omitted:
+
+```
+./go-shareenum --host server001 --user Administrator --pass adminPass123 --shares backup --get-file --remote-path "\reports\report.txt"
+```
+
+Or to an explicit local path (use --replace to overwrite an existing local file):
+
+```
+./go-shareenum --host server001 --user Administrator --pass adminPass123 --shares backup --get-file --remote-path "\reports\report.txt" --local-file ./report.txt --replace
 ```

@@ -24,6 +24,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -53,7 +54,7 @@ import (
 )
 
 var log = golog.Get("main")
-var release string = "0.4.1"
+var release string = "0.5.0"
 var includedExts map[string]interface{}
 var excludedExts map[string]interface{}
 var excludedFolders map[string]interface{}
@@ -420,7 +421,7 @@ func listFiles(session *smb.Connection, shares []string, recurse, followJunction
 		// Connect to share
 		err := session.TreeConnect(share)
 		if err != nil {
-			if err == smb.StatusMap[smb.StatusBadNetworkName] {
+			if errors.Is(err, smb.StatusMap[smb.StatusBadNetworkName]) {
 				fmt.Printf("Share %s can not be found!\n", share)
 				continue
 			}
@@ -430,7 +431,7 @@ func listFiles(session *smb.Connection, shares []string, recurse, followJunction
 		files, err := session.ListDirectory(share, dir, "")
 		if err != nil {
 
-			if err == smb.StatusMap[smb.StatusAccessDenied] {
+			if errors.Is(err, smb.StatusMap[smb.StatusAccessDenied]) {
 				session.TreeDisconnect(share)
 				fmt.Printf("Could connect to [%s] but listing files was prohibited\n", share)
 				continue
@@ -490,6 +491,9 @@ func uploadFile(conn *smb.Connection, share, localFile, remotePath string, repla
 	// Remote paths should use Windows path separators
 	remotePath = strings.ReplaceAll(remotePath, "/", "\\")
 
+	// Strip a leading drive-letter prefix (e.g. c:\, D:\); the share is the volume.
+	remotePath = stripDrivePrefix(remotePath)
+
 	if remotePath == "" {
 		err = fmt.Errorf("remote path must not be empty")
 		return
@@ -499,12 +503,9 @@ func uploadFile(conn *smb.Connection, share, localFile, remotePath string, repla
 	if remotePath[len(remotePath)-1] == '\\' {
 		remotePath += "\\" + filename
 	}
-	var modifiedRemoteFile string
-	modifiedRemoteFile = remotePath
 
-	if remotePath[0] == '\\' {
-		modifiedRemoteFile = remotePath[1:] // Skip initial slash
-	}
+	// Strip any leading separators to get the share-relative path
+	modifiedRemoteFile := strings.TrimLeft(remotePath, "\\")
 
 	// Check that local file exists
 	f, err = os.Open(localFile)
@@ -525,7 +526,7 @@ func uploadFile(conn *smb.Connection, share, localFile, remotePath string, repla
 	f2, err := conn.OpenFileExt(share, modifiedRemoteFile, createOpts)
 	if err != nil {
 		// Check if file exists and we want to replace it
-		if err == smb.StatusMap[smb.StatusObjectNameCollision] {
+		if errors.Is(err, smb.StatusMap[smb.StatusObjectNameCollision]) {
 			if !replaceFile {
 				log.Errorf("The remote file %q already exists. Run with --replace to overwrite it\n", modifiedRemoteFile)
 				return
@@ -539,6 +540,87 @@ func uploadFile(conn *smb.Connection, share, localFile, remotePath string, repla
 	}
 
 	err = conn.PutFile(share, modifiedRemoteFile, 0, f.Read)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	return nil
+}
+
+// stripDrivePrefix removes a leading Windows drive-letter prefix such as
+// "c:\" or "D:\" from a path that already uses backslash separators. A share
+// is itself a volume, so a drive-qualified path from the caller is redundant;
+// dropping the prefix yields the share-relative path. Only the "<letter>:\"
+// form is stripped; a bare "c:" with no separator is left as-is.
+func stripDrivePrefix(remotePath string) string {
+	if len(remotePath) >= 3 &&
+		remotePath[1] == ':' && remotePath[2] == '\\' {
+		c := remotePath[0]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			log.Infof("Stripping drive prefix %q from remote path\n", remotePath[:3])
+			return remotePath[3:]
+		}
+	}
+	return remotePath
+}
+
+func downloadFile(conn *smb.Connection, share, remotePath, localFile string, replaceFile bool) (err error) {
+	// Remote paths should use Windows path separators
+	remotePath = strings.ReplaceAll(remotePath, "/", "\\")
+
+	// Strip a leading drive-letter prefix (e.g. c:\, D:\) so callers may pass
+	// Windows-style absolute paths; the share is already the volume.
+	remotePath = stripDrivePrefix(remotePath)
+
+	if remotePath == "" {
+		err = fmt.Errorf("remote path must not be empty")
+		return
+	}
+
+	// A path ending in a separator has no filename to download
+	if remotePath[len(remotePath)-1] == '\\' {
+		err = fmt.Errorf("remote path %q does not specify a filename", remotePath)
+		return
+	}
+
+	// Strip any leading separators to get the share-relative path
+	modifiedRemoteFile := strings.TrimLeft(remotePath, "\\")
+
+	// Derive the remote filename (last path element) for the local destination
+	remoteFilename := modifiedRemoteFile
+	if idx := strings.LastIndex(modifiedRemoteFile, "\\"); idx != -1 {
+		remoteFilename = modifiedRemoteFile[idx+1:]
+	}
+	if remoteFilename == "" {
+		err = fmt.Errorf("could not determine filename from remote path %q", remotePath)
+		return
+	}
+	if localFile == "" {
+		localFile = remoteFilename
+	}
+
+	// Open the local destination, refusing to overwrite unless --replace was set
+	f, err := os.OpenFile(localFile, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0640)
+	if err != nil {
+		if os.IsExist(err) {
+			if !replaceFile {
+				log.Errorf("The local file %q already exists. Run with --replace to overwrite it\n", localFile)
+				return
+			}
+			f, err = os.OpenFile(localFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
+			if err != nil {
+				log.Errorln(err)
+				return
+			}
+		} else {
+			log.Errorln(err)
+			return
+		}
+	}
+	defer f.Close()
+
+	log.Infof("Trying to download the remote file %s from share: %s to local file: %s\n", modifiedRemoteFile, share, localFile)
+	err = conn.RetrieveFile(share, modifiedRemoteFile, 0, f.Write)
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -587,10 +669,15 @@ var helpMsg = `
       -r, --recurse                Recursively list directories on server
           --follow-links           Follow junctions when listing files. Might lead to loops
           --put-file               Upload --local-file to --remote-path on single share specified by --shares
-          --local-file <path>      Path to local file to upload to --remote-path
+          --get-file               Download --remote-path from single share specified by --shares to
+                                   --local-file (defaults to the remote filename in the cwd)
+          --local-file <path>      Path to local file to upload to --remote-path (--put-file), or
+                                   local destination for a --get-file download (optional for --get-file)
           --remote-path <path>     Path on share specified by --shares to upload --local-file,
-                                   or starting directory for --list (default: share root)
-          --replace                Replace any existing file with same name in --remote-path
+                                   file to download with --get-file, or starting directory for
+                                   --list (default: share root)
+          --replace                Replace any existing file with same name in --remote-path when
+                                   uploading, or the existing local file when downloading
       -c "<cmd1>; <cmd2>"          Run semicolon-separated commands non-interactively, then exit.
                                    Commands match the interactive shell. No escape syntax for ';';
                                    use --script for commands containing literal semicolons.
@@ -681,7 +768,7 @@ func matchesAny(name string, tokens []string) bool {
 func main() {
 	var host, username, password, hash, domain, shareFlag, excludeShareFlag, includeName, includeExt, excludeExt, excludeFolder, socksHost, targetIP, dcIP, aesKey, dnsHost, localFile, remotePath, batchCmd, scriptFile, keytabFile string
 	var port, socksPort, relayPort, level int
-	var dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, doRelay, noPass, interactive, kerberos, dnsTCP, followJunctions, putFile, replaceFile, listLogPackages bool
+	var dirList, recurse, shareEnumFlag, noEnc, forceSMB2, localUser, nullSession, version, doRelay, noPass, interactive, kerberos, dnsTCP, followJunctions, putFile, getFile, replaceFile, listLogPackages bool
 	var debug, verbose logFlag
 	var err error
 	var dialTimeout time.Duration
@@ -743,6 +830,7 @@ func main() {
 	flag.BoolVar(&dnsTCP, "dns-tcp", false, "")
 	flag.BoolVar(&followJunctions, "follow-links", false, "")
 	flag.BoolVar(&putFile, "put-file", false, "")
+	flag.BoolVar(&getFile, "get-file", false, "")
 	flag.BoolVar(&replaceFile, "replace", false, "")
 	flag.StringVar(&localFile, "local-file", "", "")
 	flag.StringVar(&remotePath, "remote-path", "", "")
@@ -901,8 +989,13 @@ func main() {
 		log.Errorln("-c and --script are mutually exclusive")
 		return
 	}
-	if batch && (interactive || shareEnumFlag || dirList || putFile) {
-		log.Errorln("Batch mode (-c/--script) is mutually exclusive with --interactive, --enum, --list, and --put-file")
+	if batch && (interactive || shareEnumFlag || dirList || putFile || getFile) {
+		log.Errorln("Batch mode (-c/--script) is mutually exclusive with --interactive, --enum, --list, --put-file, and --get-file")
+		return
+	}
+
+	if putFile && getFile {
+		log.Errorln("--put-file and --get-file are mutually exclusive")
 		return
 	}
 
@@ -913,8 +1006,8 @@ func main() {
 		}
 		shares = strings.Split(shareFlag, ",")
 
-		if !dirList && !putFile {
-			log.Errorln("Please specify share enum flag, list flag or put-file flag!")
+		if !dirList && !putFile && !getFile {
+			log.Errorln("Please specify share enum flag, list flag, put-file flag or get-file flag!")
 			return
 		}
 	}
@@ -943,6 +1036,17 @@ func main() {
 		}
 		if remotePath == "" {
 			log.Errorln("Must specify a --remote-path on share to upload file to")
+			return
+		}
+	}
+
+	if getFile {
+		if len(shares) != 1 {
+			log.Errorln("Specify ONE share to download file from with the --shares argument")
+			return
+		}
+		if remotePath == "" {
+			log.Errorln("Must specify a --remote-path on share to download file from")
 			return
 		}
 	}
@@ -1157,10 +1261,6 @@ func main() {
 	}
 
 	if putFile {
-		if strings.HasPrefix(remotePath, "c:\\") {
-			log.Infoln("Stripping prefix c:\\ from remote path")
-			remotePath = remotePath[3:]
-		}
 		log.Infof("Trying to upload local file %q to share %q, path %q\n", localFile, shares[0], remotePath)
 		err = uploadFile(opts.c, shares[0], localFile, remotePath, replaceFile)
 		if err != nil {
@@ -1168,6 +1268,15 @@ func main() {
 			return
 		}
 		fmt.Println("Successfully uploaded the file")
+		return
+	} else if getFile {
+		log.Infof("Trying to download remote path %q from share %q to local file %q\n", remotePath, shares[0], localFile)
+		err = downloadFile(opts.c, shares[0], remotePath, localFile, replaceFile)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		fmt.Println("Successfully downloaded the file")
 		return
 	} else if shareEnumFlag {
 		share := "IPC$"
